@@ -56,10 +56,12 @@ Every omission below falls into one of two buckets:
    was bridged without changing `Strategy`'s interface); `precision_pullback`'s
    re-entry rule still is — see its own table entry.
 
-Neither bucket is a bug in the ported strategy's entry/exit trigger logic,
-which is implemented as written in both cases (and unit-tested against
-hand-traced synthetic scenarios for `precision_pullback`, given its
-multi-day state-machine logic — see its module for the reasoning). Both
+Neither bucket covers bugs in the ported strategies' own trigger logic. One
+such bug has since been fixed: both strategies' SELL only fired on the day
+price crossed the EMA, so a bearish close below it a day or more later did
+not exit until the next qualifying cross or a Nifty exit-all.
+`precision_pullback`'s multi-day state machine is unit-tested against
+hand-traced synthetic scenarios (see its module for the reasoning). Both
 buckets mean a backtest run here will not fully reproduce a source spec's
 own published numbers, and shouldn't be read as attempting to.
 
@@ -114,7 +116,7 @@ Two things worth knowing if you're comparing a run against these numbers:
 | Risk-based/allocation-capped position sizing (2-3% risk/trade, 10-15% cap) | `backtest.py` only implements `equal_weight`. | Engine |
 | Separate hard percentage stop distinct from the 20-EMA exit | No percentage-stop concept in the engine at all. | Engine |
 
-**Result vs. published**: this repo, *before* the regime filter — CAGR 9.82%, max drawdown 12.94%, Sharpe 0.43, 1,488 trades, win rate 34.2%. This repo, *after* — CAGR 9.90%, max drawdown 16.68%, Sharpe 0.49, 1,210 trades, win rate 35.2% (full Nifty 500, 2014-09-24 to 2026-09-18). Published — CAGR 23.5%, max drawdown 27.63%, Sharpe 1.32, 994 trades, win rate 42.05%.
+**Result vs. published**: this repo, *before* the regime filter — CAGR 9.82%, max drawdown 12.94%, Sharpe 0.43, 1,488 trades, win rate 34.2%. This repo, *after* — CAGR 9.90%, max drawdown 16.68%, Sharpe 0.49, 1,210 trades, win rate 35.2% (full Nifty 500, 2014-09-24 to 2026-09-18). Published — CAGR 23.5%, max drawdown 27.63%, Sharpe 1.32, 994 trades, win rate 42.05%. After the exit, sizing, ordering and cost fixes (re-downloaded data, 2014-10-07 to 2026-09-18) — CAGR 14.94%, max drawdown 28.20%, Sharpe 0.68, 1,228 trades, win rate 34.9%. That figure uses alphabetical order to pick among same-day entries when slots are short, which turns out to be a lucky draw: over 100 random orders the median is 12.1% (90% of runs between 10.5% and 13.7%, none above 14.94%).
 
 ### `precision_pullback` (source: "Precision Pullback Strategy" PDF)
 
@@ -125,7 +127,7 @@ Two things worth knowing if you're comparing a run against these numbers:
 | Risk-based/allocation-capped position sizing | Same as `trend_ladder`. | Engine |
 | Separate hard percentage stop | Same as `trend_ladder`. | Engine |
 
-**Result vs. published**: this repo, *before* the regime filter — CAGR 11.98%, max drawdown 11.45%, Sharpe 0.70, 296 trades, win rate 39.2%. This repo, *after* — CAGR 8.64%, max drawdown 12.71%, Sharpe 0.39, 289 trades, win rate 42.2% (full Nifty 500, 2014-09-24 to 2026-09-18) — win rate and trade count moved toward published, but CAGR/Sharpe moved *away*; see "Now implemented," above, for why (whipsaw from re-entering after a forced exit-all is the leading suspect, on top of the still-omitted re-entry rule above). Published — CAGR 19.4%, max drawdown 13.71%, Sharpe 1.59, 258 trades, win rate 44.96%.
+**Result vs. published**: this repo, *before* the regime filter — CAGR 11.98%, max drawdown 11.45%, Sharpe 0.70, 296 trades, win rate 39.2%. This repo, *after* — CAGR 8.64%, max drawdown 12.71%, Sharpe 0.39, 289 trades, win rate 42.2% (full Nifty 500, 2014-09-24 to 2026-09-18) — win rate and trade count moved toward published, but CAGR/Sharpe moved *away*; see "Now implemented," above, for why (whipsaw from re-entering after a forced exit-all is the leading suspect, on top of the still-omitted re-entry rule above). Published — CAGR 19.4%, max drawdown 13.71%, Sharpe 1.59, 258 trades, win rate 44.96%. After the same fixes (2014-10-07 to 2026-09-18) — CAGR 11.51%, max drawdown 19.80%, Sharpe 0.54, 290 trades, win rate 41.7%; almost all of that change comes from the engine fixes (11.44% without the exit fix).
 
 ## What both source specs' own published numbers already admit, independent of this repo
 
@@ -140,9 +142,9 @@ apply equally to any run of these strategies against this repo's data:
   `SURVIVORSHIP_BIAS_WARNING`.
 - **No costs/taxes deducted** in the source backtests. This repo's
   `backtest.py` *does* model Indian equity delivery transaction costs
-  (STT, exchange charges, stamp duty, GST) and slippage — so on this specific
+  (STT, exchange charges, stamp duty, a per-sell DP charge, GST) and slippage — so on this specific
   point, this repo's numbers are more conservative than the source PDFs',
   not less.
-- **Fills at the exact daily close** in both the source backtests and this
-  repo's engine — a gap through the exit level fills worse in live trading
-  than either backtest assumes.
+- **Fills at the exact daily close** in the source backtests. This repo's
+  engine fills at the next day's open with slippage instead, which is
+  achievable for a scanner run after the close.

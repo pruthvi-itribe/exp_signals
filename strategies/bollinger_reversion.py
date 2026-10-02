@@ -63,6 +63,10 @@ row for every day" convention every strategy in this package follows.
 
 ## Why a stop-loss
 
+(The numbers below were measured with backtest engine v1, which sized each
+entry at ``cash / N``; the 15% stop has not been re-tuned under v2. See
+PERFORMANCE.md for v2 results.)
+
 Not part of the original screen -- added after an initial real backtest
 (fixed-horizon exit only) showed a real per-trade edge (53.5% win rate,
 average win exceeding average loss) undermined by a weak Sharpe ratio

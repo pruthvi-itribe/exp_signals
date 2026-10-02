@@ -58,6 +58,11 @@ responsibility, same as every other strategy in this package.
 
 ## Why a stop-loss
 
+(Every number in this docstring was measured with backtest engine v1, which
+sized each entry at ``cash / N``. Under v2 the same defaults score a higher
+CAGR with a much deeper drawdown -- see PERFORMANCE.md -- and the 12% stop
+has not been re-tuned under v2.)
+
 Not part of the original screen -- added after an initial real backtest
 (rebalance-only exits, no stop) showed the slow-tilt result described
 below, then tested directly against the idea that a periodic-only exit
