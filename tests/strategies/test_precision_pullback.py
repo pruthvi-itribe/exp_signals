@@ -79,8 +79,8 @@ def test_empty_input_returns_empty_output_with_right_columns():
 #             2,3,4 are each a "blue" day (close >= EMA), reaching the
 #             required 3-day streak at day 4 -> qualifies the uptrend.
 #   day 5:    drops to 90 (EMA becomes 95) -- the first RED day (the
-#             pullback) -- and it's a bearish candle closing below the EMA,
-#             so it ALSO fires the (state-independent) SELL crossing.
+#             pullback). It is a bearish candle closing below the EMA, but no
+#             BUY precedes it, so no SELL is emitted (exits are armed by entries).
 #   day 6:    drops further to 88 (EMA 91.5) -- still red, tolerated,
 #             no qualifying recovery candle yet.
 #   day 7:    bull candle open=100/close=105, both strictly above the EMA
@@ -106,23 +106,45 @@ _FULL_ROWS = [
 ]
 
 
-def test_full_pullback_cycle_fires_sell_then_buy_on_exact_days():
+def test_full_pullback_cycle_fires_buy_on_exact_day_and_no_unentered_sell():
     """Would catch: a wrong transition condition anywhere in the five-state
     machine (e.g. the recovery check not requiring the full body above the
     band, or the mark being frozen using the wrong day's high), any of which
-    would shift the BUY off day 10 or suppress it entirely.
+    would shift the BUY off day 10 or suppress it entirely; or an exit row
+    emitted on day 5 with no entry before it.
     """
     strat = PrecisionPullbackStrategy(**_SMALL)
     result = strat.generate_signals(_df(_FULL_ROWS))
 
-    assert len(result) == 2
-    sell = result[result["signal_type"] == "SELL"].iloc[0]
-    assert sell["date"] == pd.Timestamp("2024-01-06")
-    assert sell["price"] == pytest.approx(90.0)
-
-    buy = result[result["signal_type"] == "BUY"].iloc[0]
+    assert len(result) == 1
+    buy = result.iloc[0]
+    assert buy["signal_type"] == "BUY"
     assert buy["date"] == pd.Timestamp("2024-01-11")
     assert buy["price"] == pytest.approx(112.0)
+
+
+def test_exit_fires_when_the_bearish_close_comes_a_day_after_the_ema_cross():
+    """The spec's exit is "a bearish candle closes below the 50 EMA", not
+    only on the day price crossed it.
+
+    _FULL_ROWS BUYs on 2024-01-11 (EMA 109.03). 2024-01-12 gaps below the
+    EMA (103.02) on a BULL candle (95 -> 97): correctly no exit. 2024-01-13
+    is a bearish candle (97 -> 96) closing below the EMA (99.51): the exit.
+    2024-01-14 is another bearish close below it (97.25) and must not add a
+    second SELL.
+
+    Would catch: the SELL being gated on yesterday's close at/above the EMA
+    (silently dropping exits whose bearish candle comes after the cross), a
+    SELL on the bull gap-down day, or one SELL row per bearish day below.
+    """
+    strat = PrecisionPullbackStrategy(**_SMALL)
+    rows = _FULL_ROWS + [(95, 98, 94, 97), (97, 98, 95, 96), (96, 97, 94, 95)]
+    result = strat.generate_signals(_df(rows))
+
+    after_buy = result[result["date"] > pd.Timestamp("2024-01-11")]
+    assert list(after_buy["signal_type"]) == ["SELL"]
+    assert after_buy.iloc[0]["date"] == pd.Timestamp("2024-01-13")
+    assert after_buy.iloc[0]["price"] == pytest.approx(96.0)
 
 
 def test_pullback_with_no_qualifying_recovery_candle_never_buys():
@@ -135,10 +157,8 @@ def test_pullback_with_no_qualifying_recovery_candle_never_buys():
     """
     strat = PrecisionPullbackStrategy(**_SMALL)
     result = strat.generate_signals(_df(_FULL_ROWS[:7]))
-    assert result[result["signal_type"] == "BUY"].empty
-    # the pullback's initial red day still fires its independent SELL crossing
-    assert len(result) == 1
-    assert result.iloc[0]["signal_type"] == "SELL"
+    # No BUY means no position, so the pullback's bearish day emits no SELL either.
+    assert result.empty
 
 
 def test_red_day_resets_the_blue_streak_count():

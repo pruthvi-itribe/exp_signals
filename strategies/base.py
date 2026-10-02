@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import pandas as pd
@@ -162,3 +163,33 @@ class Strategy(ABC):
             DataFrame matching ``SIGNAL_OUTPUT_COLUMNS``. Only signal
             *events* should be emitted, not a HOLD row for every day.
         """
+
+
+def first_exit_after_each_buy(
+    buy: Sequence[bool], exit_condition: Sequence[bool], disarm: Sequence[bool]
+) -> list[bool]:
+    """Mark the first ``exit_condition`` day after each BUY.
+
+    All three sequences are one symbol's rows in date order; mixing symbols
+    would carry one symbol's pending exit into another's rows.
+
+    For "exit on the first day X happens while holding" rules: emits one exit
+    per entry instead of a row for every day X holds, without missing the
+    exit when X first happens later than the day a level was crossed. BUYs
+    are never suppressed, so whenever the engine holds a position, the last
+    BUY since the previous exit has armed exactly one exit.
+
+    A ``disarm`` day (e.g. a market-wide exit-all, which the caller emits
+    separately) clears the pending exit and is never itself marked.
+    """
+    marks = [False] * len(buy)
+    armed = False
+    for i in range(len(buy)):
+        if disarm[i]:
+            armed = False
+        elif armed and exit_condition[i]:
+            marks[i] = True
+            armed = False
+        if buy[i]:
+            armed = True
+    return marks

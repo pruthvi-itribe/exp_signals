@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, fields
 import pandas as pd
 import pytest
 
-from strategies.base import SIGNAL_OUTPUT_COLUMNS, Strategy, StrategyConfig
+from strategies.base import SIGNAL_OUTPUT_COLUMNS, Strategy, StrategyConfig, first_exit_after_each_buy
 
 
 @dataclass(frozen=True)
@@ -135,3 +135,50 @@ def test_param_info_reflects_fields_defaults_and_descriptions():
 
 def test_param_info_empty_for_base_class_with_no_fields():
     assert StrategyConfig.param_info() == {}
+
+
+# --- first_exit_after_each_buy ------------------------------------------------
+
+
+def _marks(buy: list[int], exit_condition: list[int], disarm: list[int] | None = None) -> list[bool]:
+    """Run first_exit_after_each_buy on 0/1 lists (no disarm days by default)."""
+    return first_exit_after_each_buy(
+        [bool(x) for x in buy],
+        [bool(x) for x in exit_condition],
+        [bool(x) for x in (disarm or [0] * len(buy))],
+    )
+
+
+def test_each_buy_arms_exactly_one_exit():
+    """BUY, exit, BUY, exit: both entries get their own exit.
+
+    Would catch: only the first BUY ever arming an exit (every later
+    position held to the end of the backtest)."""
+    buy = [1, 0, 0, 1, 0, 0]
+    ext = [0, 1, 1, 0, 1, 1]
+    assert _marks(buy, ext) == [False, True, False, False, True, False]
+
+
+def test_a_buy_while_armed_keeps_one_pending_exit():
+    """BUY, BUY (engine may have skipped the first), then two exit days: one
+    exit, on the first of them.
+
+    Would catch: a second BUY cancelling the pending exit, or arming a second
+    one (two SELL rows for one position)."""
+    assert _marks([1, 1, 0, 0], [0, 0, 1, 1]) == [False, False, True, False]
+
+
+def test_disarm_day_clears_the_pending_exit():
+    """BUY, a disarm day (e.g. a Nifty exit-all, which the caller emits),
+    then a bearish exit day with no new BUY: no second exit.
+
+    Would catch: the breakdown not consuming the pending exit, which emits a
+    SELL for a position the exit-all already closed."""
+    assert _marks([1, 0, 0], [0, 0, 1], disarm=[0, 1, 0]) == [False, False, False]
+
+
+def test_exit_condition_with_no_buy_marks_nothing():
+    """Would catch: exits marked with no entry before them (SELL rows for
+    positions the strategy never opened)."""
+    assert _marks([0, 0, 0], [1, 1, 1]) == [False, False, False]
+

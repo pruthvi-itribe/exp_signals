@@ -56,7 +56,7 @@ from enum import Enum, auto
 
 import pandas as pd
 
-from strategies.base import SIGNAL_OUTPUT_COLUMNS, Strategy, StrategyConfig
+from strategies.base import SIGNAL_OUTPUT_COLUMNS, Strategy, StrategyConfig, first_exit_after_each_buy
 from strategies.registry import register_strategy
 
 
@@ -132,14 +132,14 @@ class PrecisionPullbackStrategy(Strategy):
     after a trade (the one exception, "one re-entry per cycle," is a
     documented omission — see this module's docstring).
 
-    SELL is a simple, state-independent crossing event, like every other
-    strategy's exit: a bearish candle (close < open) whose close crosses
-    from at/above the EMA to below it -- OR unconditionally for every
-    symbol on the one day the Nifty 50 market-regime filter flags as a
-    breakdown ("Nifty filter exit-all"; see `src.market_regime`, inert if
-    that data isn't attached to the input). `backtest.py`'s engine already
-    ignores a SELL for a symbol with no open position, so this needs no
-    extra "is a position open" tracking here either. The entry-side
+    SELL fires on the first bearish candle (close < open) closing below the
+    EMA after each BUY -- not only on the day price crossed the EMA, so a
+    gap below on a bull candle followed by a bearish close still exits --
+    OR unconditionally for every symbol on the one day the Nifty 50
+    market-regime filter flags as a breakdown ("Nifty filter exit-all"; see
+    `src.market_regime`, inert if that data isn't attached to the input).
+    `backtest.py`'s engine ignores a SELL for a symbol with no open
+    position. The entry-side
     continuation trigger (state 5, below) additionally requires the regime
     filter to be bullish that day.
 
@@ -225,6 +225,7 @@ class PrecisionPullbackStrategy(Strategy):
         n = len(group)
 
         rows: list[dict[str, object]] = []
+        buy_days = [False] * n
 
         state = _State.COUNTING_BLUE
         blue_streak = 0
@@ -284,6 +285,7 @@ class PrecisionPullbackStrategy(Strategy):
                     mark = None
                     continue
                 if is_bull and mark is not None and price[i] > mark and nifty_bullish[i]:
+                    buy_days[i] = True
                     rows.append(
                         {
                             "symbol": symbol,
@@ -299,14 +301,16 @@ class PrecisionPullbackStrategy(Strategy):
                     mark = None
                 continue
 
-        # SELL: a simple, state-independent crossing event -- a bearish candle whose
-        # close crosses from at/above the EMA to below it, mirroring how every other
-        # strategy's exit is generated independently of entry-side state. The Nifty
-        # breakdown exit fires unconditionally for every symbol on that one day
-        # (checked first, and skips the normal condition below on the same day so a
-        # symbol never gets two SELL rows on the same date).
-        prev_price = adj_close.shift(1).to_numpy()
-        prev_ema = pd.Series(ema).shift(1).to_numpy()
+        # SELL: a bearish candle closing below the EMA -- the first such day after
+        # each BUY, not only the day price crossed the EMA (a gap below on a bull
+        # candle followed by a bearish close is still an exit). One SELL per
+        # entry keeps signals as events rather than a row per bearish day. The
+        # Nifty breakdown exit fires unconditionally for every symbol on that one
+        # day (and never doubles up with a normal SELL on the same date).
+        exit_condition = [
+            not pd.isna(ema[i]) and raw_close[i] < raw_open[i] and price[i] < ema[i] for i in range(n)
+        ]
+        normal_exits = first_exit_after_each_buy(buy_days, exit_condition, nifty_breakdown)
         for i in range(n):
             if nifty_breakdown[i]:
                 rows.append(
@@ -319,10 +323,7 @@ class PrecisionPullbackStrategy(Strategy):
                         "reason": "Nifty filter exit-all",
                     }
                 )
-                continue
-            if i == 0 or pd.isna(ema[i]) or pd.isna(prev_ema[i]):
-                continue
-            if prev_price[i] >= prev_ema[i] and raw_close[i] < raw_open[i] and price[i] < ema[i]:
+            elif normal_exits[i]:
                 rows.append(
                     {
                         "symbol": symbol,
