@@ -352,7 +352,7 @@ def _simulate(
         initial_capital: Starting cash.
         slippage_pct: Slippage in percentage points applied against fills.
         max_concurrent_positions: Cap on simultaneously open positions; also
-            the equal-weight sizing divisor.
+            the equal-weight sizing divisor (of equity, not of remaining cash).
 
     Returns:
         Tuple of ``(trades, equity_rows, skipped_signal_count)``.
@@ -365,6 +365,9 @@ def _simulate(
         executions_by_date.setdefault(item["exec_date"], []).append(item)
 
     cash = float(initial_capital)
+    # Equity at the previous close: the sizing basis for today's fills, known
+    # before the open (never today's close, which isn't known yet).
+    prior_equity = float(initial_capital)
     open_positions: dict[str, dict[str, object]] = {}
     trades: list[dict[str, object]] = []
     equity_rows: list[dict[str, object]] = []
@@ -383,8 +386,9 @@ def _simulate(
                     continue
 
                 fill_price = open_price * (1 + slippage_frac)
-                allocation = cash / max_concurrent_positions
-                quantity = int(allocation // fill_price)
+                budget = min(prior_equity / max_concurrent_positions, cash)
+                cost_rate = calculate_transaction_cost(fill_price, "BUY") / fill_price
+                quantity = int(budget // (fill_price * (1 + cost_rate)))
                 if quantity < 1:
                     skipped += 1
                     continue
@@ -437,6 +441,10 @@ def _simulate(
                 "equity": cash + positions_value,
             }
         )
+        # A held symbol with no known close yet makes today's mark NaN; keep
+        # sizing from the last finite equity rather than feeding NaN onward.
+        if np.isfinite(cash + positions_value):
+            prior_equity = cash + positions_value
 
     return trades, equity_rows, skipped
 
@@ -550,9 +558,11 @@ def run_backtest(
     ``slippage_pct`` is in percentage points (``0.05`` means 0.05%) and
     always worsens the fill — buys pay above open, sells give up below open.
 
-    Only ``position_sizing='equal_weight'`` is supported: each BUY allocates
-    ``current_cash / max_concurrent_positions`` and buys as many whole shares
-    as that affords. A BUY signal is skipped (not queued, not retried) if the
+    Only ``position_sizing='equal_weight'`` is supported: each BUY targets
+    ``equity / max_concurrent_positions``, with equity marked at the previous
+    close (``initial_capital`` on the first day), capped by available cash,
+    and buys as many whole shares as that budget affords including buy-side
+    costs. A BUY signal is skipped (not queued, not retried) if the
     symbol already has an open position, ``max_concurrent_positions`` is
     already reached, or the allocation can't cover even one share. A SELL
     signal for a symbol with no open position is ignored.

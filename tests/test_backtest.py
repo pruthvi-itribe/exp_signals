@@ -211,16 +211,15 @@ def test_transaction_cost_calculation():
 def test_multiple_concurrent_positions_capital_allocation(monkeypatch):
     """3 symbols BUY on the same day at the same price, max_concurrent_positions=3.
 
-    Equal-weight sizing recomputes `cash / max_concurrent_positions` from
-    *current* cash for every fill (per run_backtest's own docstring), not a
-    fixed pre-split budget -- so within one day, the alphabetically-first
-    symbol (per _schedule_executions's sort) gets a full 1/3 of capital, the
-    next gets 1/3 of what's left, etc. This pins down that exact sequential
-    result by hand.
+    Equal-weight sizing targets ``equity / max_concurrent_positions``, with
+    equity marked at the previous close (initial capital on the first day),
+    capped by the cash actually available. All three fills share the same
+    target, so each gets a full 1/3 regardless of the order they execute in.
 
-    Would catch: a double-spend bug (each position computing its share of
-    the *original* capital independently, letting total allocation exceed
-    initial_capital) or a sizing divisor that ignores max_concurrent_positions.
+    Would catch: a double-spend bug (total allocation exceeding
+    initial_capital), a sizing divisor that ignores max_concurrent_positions,
+    or sizing from *remaining cash* (which gives later fills on the same day
+    1/3 of a shrinking balance: 1000, 666, 444 shares here).
     """
     _zero_cost(monkeypatch)
 
@@ -255,20 +254,164 @@ def test_multiple_concurrent_positions_capital_allocation(monkeypatch):
         [run_id],
     ).df()
 
-    # Hand-computed sequential allocation (fill_price = 100 for all three):
-    #   AAA: alloc = 300000/3 = 100000.00 -> qty = int(100000.00/100) = 1000, value=100000, cash -> 200000
-    #   BBB: alloc = 200000/3 =  66666.67 -> qty = int( 66666.67/100) =  666, value= 66600, cash -> 133400
-    #   CCC: alloc = 133400/3 =  44466.67 -> qty = int( 44466.67/100) =  444, value= 44400, cash ->  89000
-    expected_quantity = {"AAA": 1000, "BBB": 666, "CCC": 444}
+    # Hand-computed (fill_price = 100 for all three): target = 300000/3 = 100000
+    # for each, cash 300000 -> 200000 -> 100000 -> 0, never short of the target.
+    expected_quantity = {"AAA": 1000, "BBB": 1000, "CCC": 1000}
     for _, row in trades.iterrows():
         assert row["quantity"] == expected_quantity[row["symbol"]]
         assert row["entry_price"] == pytest.approx(100.0)
 
     total_allocated = float((trades["quantity"] * trades["entry_price"]).sum())
-    assert total_allocated == pytest.approx(100_000 + 66_600 + 44_400)
+    assert total_allocated == pytest.approx(300_000)
     # The double-spend guard: total allocated across all positions opened on
     # the same day must never exceed initial_capital.
     assert total_allocated <= 300_000
+
+    conn.close()
+
+
+def test_position_size_follows_marked_equity_not_remaining_cash(monkeypatch):
+    """Two slots, 200000 capital. AAA fills at 100 (target 200000/2 = 100000
+    -> 1000 shares, cash 100000 left) and closes that day at 50, so equity at
+    the close is 100000 + 1000*50 = 150000. BBB's BUY fills the next morning
+    at 100: its target is 150000/2 = 75000 -> 750 shares. AAA closes at 70
+    on the fill day itself, which the engine cannot know at the open.
+
+    Would catch: sizing from remaining cash (100000/2 -> 500 shares), which
+    shrinks every later position as more slots fill, or marking equity at the
+    fill day's own close (170000/2 -> 850 shares), a price not yet known.
+    """
+    _zero_cost(monkeypatch)
+
+    conn = _make_conn()
+    strategy = "test_strategy"
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 50), ("2024-01-03", 50, 70)])
+    _insert_ohlcv(conn, "BBB", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100), ("2024-01-03", 100, 100)])
+    _insert_signal(conn, "AAA", "2024-01-01", strategy, "BUY")
+    _insert_signal(conn, "BBB", "2024-01-02", strategy, "BUY")
+
+    run_id = run_backtest(
+        conn,
+        strategy_name=strategy,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        initial_capital=200_000,
+        slippage_pct=0.0,
+        symbols=["AAA", "BBB"],
+        max_concurrent_positions=2,
+    )
+
+    quantity = dict(
+        conn.execute("SELECT symbol, quantity FROM backtest_trades WHERE run_id = ?", [run_id]).fetchall()
+    )
+    assert quantity == {"AAA": 1000, "BBB": 750}
+
+    conn.close()
+
+
+def test_position_size_is_capped_by_available_cash(monkeypatch):
+    """Two slots, 100000 capital. AAA fills at 100 (target 50000 -> 500
+    shares, cash 50000 left) and closes at 200, so equity is 150000 and
+    BBB's target is 75000 -- but only 50000 of cash is left. BBB must buy
+    what the cash affords (500 shares at 100), not be skipped.
+
+    Would catch: the target ignoring available cash (a 750-share order that
+    the debit guard then rejects, losing the entry).
+    """
+    _zero_cost(monkeypatch)
+
+    conn = _make_conn()
+    strategy = "test_strategy"
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 200), ("2024-01-03", 200, 200)])
+    _insert_ohlcv(conn, "BBB", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100), ("2024-01-03", 100, 100)])
+    _insert_signal(conn, "AAA", "2024-01-01", strategy, "BUY")
+    _insert_signal(conn, "BBB", "2024-01-02", strategy, "BUY")
+
+    run_id = run_backtest(
+        conn,
+        strategy_name=strategy,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        initial_capital=100_000,
+        slippage_pct=0.0,
+        symbols=["AAA", "BBB"],
+        max_concurrent_positions=2,
+    )
+
+    quantity = dict(
+        conn.execute("SELECT symbol, quantity FROM backtest_trades WHERE run_id = ?", [run_id]).fetchall()
+    )
+    assert quantity == {"AAA": 500, "BBB": 500}
+
+    conn.close()
+
+
+def test_sizing_survives_a_held_symbol_with_no_known_close_yet(monkeypatch):
+    """AAA fills on 2024-01-02 but has no non-null close until 2024-01-03,
+    so the 2024-01-02 mark-to-market equity is NaN. BBB's entry that next
+    morning must still be sized (from the last finite equity, 100000/2 ->
+    500 shares) instead of crashing on int(NaN).
+
+    Would catch: a NaN equity mark reaching the quantity calculation.
+    """
+    _zero_cost(monkeypatch)
+    price_df = pd.DataFrame(
+        {
+            "symbol": ["AAA"] * 3 + ["BBB"] * 3,
+            "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"] * 2),
+            "open": [100.0] * 6,
+            "close": [np.nan, np.nan, 100.0, 100.0, 100.0, 100.0],
+        }
+    )
+    signals = pd.DataFrame(
+        {
+            "symbol": ["AAA", "BBB"],
+            "date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+            "signal_type": ["BUY", "BUY"],
+        }
+    )
+    price_index = backtest._build_price_index(price_df)
+    close_matrix = price_df.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
+    scheduled = backtest._schedule_executions(signals, price_index)
+
+    trades, _, _ = backtest._simulate(scheduled, price_index, close_matrix, 100_000, 0.0, 2)
+
+    assert {t["symbol"]: t["quantity"] for t in trades} == {"AAA": 500, "BBB": 500}
+
+
+def test_buy_is_shrunk_to_fit_cash_after_costs_not_skipped():
+    """One slot, 100000 capital, real transaction costs. The target is the
+    whole 100000, but 1000 shares at 100 plus buy-side costs (~0.119%) would
+    need 100119 of cash. The buy must shrink to the largest quantity whose
+    value plus costs fits: floor(100000 / (100 * 1.00119171)) = 998 shares.
+
+    Would catch: a BUY being skipped outright whenever the target allocation
+    leaves no room for costs (with one slot, every single entry), or cash
+    going negative because costs were left out of the fit.
+    """
+    conn = _make_conn()
+    strategy = "test_strategy"
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100), ("2024-01-03", 100, 100)])
+    _insert_signal(conn, "AAA", "2024-01-01", strategy, "BUY")
+
+    run_id = run_backtest(
+        conn,
+        strategy_name=strategy,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        initial_capital=100_000,
+        slippage_pct=0.0,
+        symbols=["AAA"],
+        max_concurrent_positions=1,
+    )
+
+    trade = conn.execute(
+        "SELECT quantity, entry_price, entry_cost FROM backtest_trades WHERE run_id = ?", [run_id]
+    ).df()
+    assert len(trade) == 1
+    row = trade.iloc[0]
+    assert row["quantity"] == 998
+    assert row["quantity"] * row["entry_price"] + row["entry_cost"] <= 100_000
 
     conn.close()
 
