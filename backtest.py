@@ -271,7 +271,8 @@ def _schedule_executions(
     (they cannot be executed inside the backtest range).
 
     Returns:
-        Executions sorted by ``exec_date`` then ``symbol``, each a dict with
+        Executions sorted by ``exec_date``, then SELLs before BUYs, then
+        ``symbol``, each a dict with
         ``symbol``, ``signal_date``, ``signal_type``, ``exec_date``.
     """
     scheduled: list[dict[str, object]] = []
@@ -294,7 +295,9 @@ def _schedule_executions(
             }
         )
 
-    scheduled.sort(key=lambda item: (item["exec_date"], item["symbol"]))
+    # SELLs before BUYs on the same morning: an exit frees its slot and cash
+    # for that day's entries, whatever the tickers are called.
+    scheduled.sort(key=lambda item: (item["exec_date"], item["signal_type"] != "SELL", item["symbol"]))
     return scheduled
 
 

@@ -416,6 +416,53 @@ def test_buy_is_shrunk_to_fit_cash_after_costs_not_skipped():
     conn.close()
 
 
+def test_same_day_sell_frees_its_slot_before_buys_execute(monkeypatch):
+    """One slot. ZZZ is held; its SELL and AAA's BUY both execute at the
+    2024-01-03 open. A real trader's orders are independent of ticker
+    spelling: the exit frees the slot and its cash for the entry that
+    morning. AAA must fill at 100 with the full equity, ZZZ exit at 120.
+
+    Would catch: executions on a day running in alphabetical order with BUYs
+    and SELLs interleaved, so AAA (sorted before ZZZ) finds the slot still
+    taken and is skipped -- an entry lost purely because of its name.
+    """
+    _zero_cost(monkeypatch)
+
+    conn = _make_conn()
+    strategy = "test_strategy"
+    _insert_ohlcv(conn, "ZZZ", [("2024-01-01", 100, 100), ("2024-01-02", 100, 110), ("2024-01-03", 120, 120)])
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100), ("2024-01-03", 100, 100)])
+    _insert_signal(conn, "ZZZ", "2024-01-01", strategy, "BUY")
+    _insert_signal(conn, "ZZZ", "2024-01-02", strategy, "SELL")
+    _insert_signal(conn, "AAA", "2024-01-02", strategy, "BUY")
+
+    run_id = run_backtest(
+        conn,
+        strategy_name=strategy,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        initial_capital=100_000,
+        slippage_pct=0.0,
+        symbols=["AAA", "ZZZ"],
+        max_concurrent_positions=1,
+    )
+
+    trades = conn.execute(
+        "SELECT symbol, entry_date, entry_price, quantity, exit_reason FROM backtest_trades "
+        "WHERE run_id = ? ORDER BY symbol",
+        [run_id],
+    ).df()
+    assert list(trades["symbol"]) == ["AAA", "ZZZ"]
+    aaa = trades.iloc[0]
+    assert pd.Timestamp(aaa["entry_date"]) == pd.Timestamp("2024-01-03")
+    assert aaa["entry_price"] == pytest.approx(100.0)
+    # Equity at the 2024-01-02 close: 1000 ZZZ shares * 110 = 110000.
+    assert aaa["quantity"] == 1100
+    assert trades.iloc[1]["exit_reason"] == "SIGNAL"
+
+    conn.close()
+
+
 def test_force_close_at_end_of_backtest(monkeypatch):
     """A BUY with no matching SELL before end_date is force-closed at end_date.
 
