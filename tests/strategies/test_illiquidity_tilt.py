@@ -53,11 +53,21 @@ def _panel(series: dict[str, dict[str, list[float]]], start="2024-01-01") -> pd.
         {"top_quantile": 1.0},
         {"top_quantile": 1.5},
         {"rebalance_every_days": 0},
+        {"stop_loss_pct": 0.0},
+        {"stop_loss_pct": -5.0},
     ],
 )
 def test_config_rejects_invalid_parameter(kwargs):
     with pytest.raises(ValueError):
         IlliquidityTiltStrategy(**kwargs)
+
+
+def test_stop_loss_defaults_to_12_pct_enabled():
+    """Validated via a real backtest sweep (see the module docstring's 'Why
+    a stop-loss' section) -- 12% improved CAGR, Sharpe, AND max drawdown
+    simultaneously on both the Nifty 50 and Nifty 500, so it's the default,
+    not an opt-in."""
+    assert IlliquidityTiltStrategy().config.stop_loss_pct == 12.0
 
 
 def test_name_folds_window_and_rebalance_cadence():
@@ -212,3 +222,134 @@ def test_output_columns_and_strategy_name():
     result = strat.generate_signals(_trace_panel())
     assert list(result.columns) == list(SIGNAL_OUTPUT_COLUMNS)
     assert (result["strategy"] == strat.name).all()
+
+
+# --- Per-position stop-loss ---------------------------------------------------
+#
+# Setup shared by every stop-loss test below: window=2, top_quantile=0.3,
+# rebalance_every_days=3 (rebalance dates 0, 3, 6, ...) with 3 symbols, same
+# illiquidity-formula convention as _trace_panel -- A jumps once at day 3
+# (illiquidity spikes, independently recomputed as 1.67e-6 at day 3, versus
+# B/C's oscillation giving ~1e-7), so A is the single qualifier (threshold
+# 0.7 for top_quantile=0.3 with 3 symbols) and gets BOUGHT at day 3 @150.
+# B and C oscillate mildly throughout and never qualify, same as
+# _trace_panel, so they never interfere with any assertion below. The crash
+# is deliberately placed at day 5 -- a NON-rebalance day (next rebalance is
+# day 6) -- so a stop-loss firing there can be asserted in isolation, with
+# no same-day rebalance logic to interact with it.
+
+_STOP_SMALL = dict(window=2, top_quantile=0.3, rebalance_every_days=3, stop_loss_pct=10.0)
+
+
+def _stop_panel(a_close: list[float]) -> pd.DataFrame:
+    """8-day panel; only A's close path varies between tests. B/C are fixed
+    flat-oscillating non-qualifiers (see module-level comment above)."""
+    bc = [100, 101, 100, 101, 100, 101, 100, 101][: len(a_close)]
+    return _panel(
+        {
+            "A": {"close": a_close, "volume": [1000] * len(a_close)},
+            "B": {"close": bc, "volume": [1000] * len(bc)},
+            "C": {"close": bc, "volume": [1000] * len(bc)},
+        }
+    )
+
+
+def test_stop_loss_fires_on_a_non_rebalance_day():
+    """A is bought at day 3 (@150). Day 5 (not a rebalance day) crashes to
+    130, a -13.33% move from entry -- breaches the 10% stop. The SELL must
+    land on day 5, with no rebalance involved at all (day 5 isn't one).
+
+    Would catch: the stop-loss check being skipped on non-rebalance days,
+    or evaluated against the wrong reference price (e.g. the previous
+    day's close instead of the position's own entry price).
+    """
+    strat = IlliquidityTiltStrategy(**_STOP_SMALL)
+    a_close = [100, 100, 100, 150, 150, 130, 130, 130]
+    result = strat.generate_signals(_stop_panel(a_close))
+    a_rows = result[result["symbol"] == "A"].sort_values("date").reset_index(drop=True)
+
+    assert a_rows.iloc[0]["signal_type"] == "BUY"
+    assert a_rows.iloc[0]["date"] == pd.Timestamp("2024-01-04")  # day 3
+    stop_row = a_rows[(a_rows["signal_type"] == "SELL") & (a_rows["date"] == pd.Timestamp("2024-01-06"))]  # day 5
+    assert len(stop_row) == 1
+    assert stop_row.iloc[0]["price"] == pytest.approx(130.0)
+    assert "Stop-loss" in stop_row.iloc[0]["reason"]
+
+
+def test_stop_loss_exact_boundary_is_inclusive():
+    """Exactly -10% (150 -> 135) must trigger; -9.33% (150 -> 136) must not,
+    leaving A held through day 5 with no SELL at all that day (day 5 is not
+    a rebalance day, so nothing else could emit one).
+
+    Would catch: an off-by-a-sign or strict-inequality mistake at the exact
+    threshold.
+    """
+    strat = IlliquidityTiltStrategy(**_STOP_SMALL)
+
+    exact = [100, 100, 100, 150, 150, 135, 135, 135]
+    result_exact = strat.generate_signals(_stop_panel(exact))
+    sells_exact = result_exact[
+        (result_exact["symbol"] == "A")
+        & (result_exact["signal_type"] == "SELL")
+        & (result_exact["date"] == pd.Timestamp("2024-01-06"))
+    ]
+    assert len(sells_exact) == 1
+    assert "Stop-loss" in sells_exact.iloc[0]["reason"]
+
+    just_above = [100, 100, 100, 150, 150, 136, 136, 136]
+    result_above = strat.generate_signals(_stop_panel(just_above))
+    sells_above = result_above[
+        (result_above["symbol"] == "A") & (result_above["signal_type"] == "SELL") & (result_above["date"] == pd.Timestamp("2024-01-06"))
+    ]
+    assert sells_above.empty
+
+
+def test_stop_loss_can_be_explicitly_disabled():
+    """Same crash as test_stop_loss_fires_on_a_non_rebalance_day, but with
+    stop_loss_pct explicitly set to None -- no SELL may appear on day 5 at
+    all, since that's not a rebalance day and the stop is off.
+
+    Would catch: the stop-loss check running even when stop_loss_pct is
+    None (e.g. treating None as 0 instead of "disabled").
+    """
+    strat = IlliquidityTiltStrategy(window=2, top_quantile=0.3, rebalance_every_days=3, stop_loss_pct=None)
+    a_close = [100, 100, 100, 150, 150, 130, 130, 130]
+    result = strat.generate_signals(_stop_panel(a_close))
+    day5 = result[result["date"] == pd.Timestamp("2024-01-06")]
+    assert day5.empty
+
+
+def test_stop_loss_allows_fresh_re_entry_at_next_rebalance():
+    """After the day-5 stop-loss, A's own rolling illiquidity is still
+    elevated by the crash itself, so it qualifies again at the day-6
+    rebalance and is bought fresh -- the stop-loss must not permanently
+    lock a symbol out.
+
+    Would catch: a stop-loss SELL leaving stale state that blocks a later,
+    independently-qualifying BUY for the same symbol.
+    """
+    strat = IlliquidityTiltStrategy(**_STOP_SMALL)
+    a_close = [100, 100, 100, 150, 150, 130, 130, 130]
+    result = strat.generate_signals(_stop_panel(a_close))
+    a_rows = result[result["symbol"] == "A"].sort_values("date").reset_index(drop=True)
+
+    assert list(a_rows["signal_type"]) == ["BUY", "SELL", "BUY"]
+    assert a_rows.iloc[2]["date"] == pd.Timestamp("2024-01-07")  # day 6: fresh entry allowed
+    assert a_rows.iloc[2]["price"] == pytest.approx(130.0)
+
+
+def test_stop_loss_missing_price_on_a_day_is_left_held_not_stopped():
+    """A is held after day 3. If A's row is entirely absent at day 5 (a
+    data gap, not a price), there's nothing to evaluate the stop against --
+    it must be left held, not force-sold, and must not KeyError.
+
+    Would catch: a lookup that raises or silently treats a missing day as
+    a breach instead of skipping it.
+    """
+    strat = IlliquidityTiltStrategy(**_STOP_SMALL)
+    a_close = [100, 100, 100, 150, 150, 130, 130, 130]
+    df = _stop_panel(a_close)
+    df = df[~((df["symbol"] == "A") & (df["date"] == pd.Timestamp("2024-01-06")))]  # remove A's day-5 row
+
+    result = strat.generate_signals(df)
+    assert result[result["date"] == pd.Timestamp("2024-01-06")].empty  # no stop fired for A

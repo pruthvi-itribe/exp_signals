@@ -56,27 +56,87 @@ the Nifty 50. Running this against the Nifty 500 (or any other universe)
 would be trading an untested claim -- universe selection is the caller's
 responsibility, same as every other strategy in this package.
 
+## Why a stop-loss
+
+Not part of the original screen -- added after an initial real backtest
+(rebalance-only exits, no stop) showed the slow-tilt result described
+below, then tested directly against the idea that a periodic-only exit
+leaves a position exposed to a large intra-quarter drawdown with no way
+to cut it short before the next scheduled rebalance (up to
+``rebalance_every_days`` trading days away). Unlike ``bollinger_reversion``'s
+stop-loss tuning -- which traded a bit of win rate for better Sharpe --
+this one is a genuine win on every axis: simulating every threshold from
+5% to 30% as a real full backtest (not an approximation) on the Nifty 50,
+CAGR rose from 17.04% (no stop) to a peak of 18.14% at 12%, Sharpe rose
+from 1.01 to 1.11, AND max drawdown fell from 24.03% to 20.44% --
+simultaneously, not a trade-off. 8%, 10%, and 15% all improved on the
+no-stop baseline too (CAGR 17.4-18.0%, Sharpe 1.05-1.10), confirming 12%
+isn't a lone lucky threshold. The same default, re-tested on the full
+Nifty 500 (see "Result vs. a Nifty 500 buy-and-hold benchmark," below),
+improved CAGR from 17.48% to 22.79% and Sharpe from 1.25 to 1.57 -- an
+even larger gain, not a universe-specific fluke.
+
+``stop_loss_pct`` defaults to 12.0 for this reason. Win rate drops
+noticeably at every threshold tested (e.g. 69.1% with no stop vs. 52.6%
+at 12%) -- expected and not a red flag by itself: a stop-loss converts
+some positions that would have recovered into realized small losses,
+trading win rate for a better-shaped return distribution, the same
+pattern documented for ``bollinger_reversion``'s own stop-loss.
+
 ## Result vs. a Nifty 50 buy-and-hold benchmark
 
 This strategy's own screened claim is about a slow factor tilt, not a
 reactive trade, so the right comparison is a passive benchmark over the
 same window, not a short-horizon forward-return table. Full-history
-backtest (default params, Nifty 50, 2013-01-02 to 2026-09-25): CAGR
-17.04%, Sharpe 1.01, max drawdown 24.03%, win rate 69.1%, 110 trades.
-Equal-weight buy-and-hold over the identical window (44 of the 50 symbols
-were already listed at the window's start; the other 6 are excluded from
-the benchmark basket, not from the strategy's own run): CAGR 18.43%,
-Sharpe 0.70, max drawdown 41.12%. Both Sharpe figures use the same
-risk-free-adjusted formula as ``backtest.calculate_metrics``, for a fair
-comparison.
+backtest (default params, including the 12% stop-loss, Nifty 50,
+2013-01-02 to 2026-09-25): CAGR 18.14%, Sharpe 1.11, max drawdown 20.44%,
+win rate 52.6%, 156 trades (no-stop baseline, for reference: CAGR 17.04%,
+Sharpe 1.01, max drawdown 24.03%, win rate 69.1%, 110 trades). Equal-weight
+buy-and-hold over the identical window (44 of the 50 symbols were already
+listed at the window's start; the other 6 are excluded from the benchmark
+basket, not from the strategy's own run): CAGR 18.43%, Sharpe 0.70, max
+drawdown 41.12%. Both Sharpe figures use the same risk-free-adjusted
+formula as ``backtest.calculate_metrics``, for a fair comparison.
 
-Reads exactly as the slow-tilt hypothesis predicted: this does NOT beat
-buy-and-hold on raw CAGR (17.04% vs. 18.43%, a real but small gap), but it
-clears it by a wide margin on both risk measures (Sharpe 1.01 vs. 0.70;
-max drawdown 24.03% vs. 41.12%, nearly half) -- holding a smaller,
-periodically-refreshed basket concentrated in the persistently-illiquid
-names gave up a little upside for a meaningfully smoother ride, rather
-than producing an outright CAGR edge over the index.
+With the stop-loss, this is now within half a point of buy-and-hold's raw
+CAGR (18.14% vs. 18.43%) while still clearing it by a wide margin on both
+risk measures (Sharpe 1.11 vs. 0.70; max drawdown 20.44% vs. 41.12%, less
+than half) -- holding a smaller, periodically-refreshed basket
+concentrated in the persistently-illiquid names, with a cut on the worst
+intra-quarter losses, now very nearly matches the index's own return with
+meaningfully less risk, rather than giving up CAGR for it.
+
+## Result vs. a Nifty 500 buy-and-hold benchmark
+
+Run on direct request against this module's own "untested claim" warning
+above (the underlying signal screened weaker on the Nifty 500, IC 0.062
+vs. 0.110 on Nifty 50 at 60 days). The research runner used to produce
+this number needed one correction first: its shared default
+``max_concurrent_positions=10`` matches the Nifty 50 run's ~10-name target
+basket (0.2 x 50) but would silently throttle this universe's real
+~100-name target basket (0.2 x 501) down to 10 -- recomputed to 100
+before trusting the result. Full-history backtest (default params,
+including the 12% stop-loss, Nifty 500, 2013-01-02 to 2026-09-25): CAGR
+22.79%, Sharpe 1.57, max drawdown 27.24%, win rate 43.0%, 1,513 trades
+(no-stop baseline: CAGR 17.48%, Sharpe 1.25, max drawdown 29.66%, win
+rate 70.8%, 893 trades). Equal-weight buy-and-hold over the identical
+window (310 of the 501 symbols present since the window's start) scored
+CAGR 21.64%, Sharpe 0.86, max drawdown 46.82%.
+
+With the stop-loss, this strategy now BEATS buy-and-hold outright on the
+Nifty 500 -- higher CAGR (22.79% vs. 21.64%), much higher Sharpe (1.57
+vs. 0.86), and a smaller max drawdown (27.24% vs. 46.82%) -- not merely a
+better risk-adjusted trade-off, as it was on Nifty 50. This result is
+still read with real caution, independent of the stop-loss: performance
+did not degrade the way the weaker screening-stage IC predicted on this
+universe either before or after adding the stop, which could mean the
+illiquidity premium is more robust across the broader market than that
+single IC number suggested, OR that this backtest's flat 0.05% slippage
+assumption understates real execution cost across ~100 small/micro-cap
+illiquid names specifically (a materially different liquidity profile
+than 10 "least liquid of the Nifty 50" large-caps). Unresolved -- see
+``candidates/illiquidity_tilt.md`` for the full list of open questions
+before sizing real capital into this.
 """
 
 from __future__ import annotations
@@ -121,6 +181,21 @@ class IlliquidityTiltConfig(StrategyConfig):
             )
         },
     )
+    stop_loss_pct: float | None = field(
+        default=12.0,
+        metadata={
+            "description": (
+                "Exit a position immediately (any day, not just at a rebalance) once its adj_close "
+                "closes this many percent or more below its own entry price -- e.g. 12.0 means -12%. "
+                "Defaults to 12.0 after directly simulating every threshold from 5 to 30 on a real "
+                "historical run: it improved CAGR, Sharpe, AND max drawdown simultaneously on both "
+                "the Nifty 50 and Nifty 500 (a genuine win, not a trade-off), with 8/10/15 all also "
+                "improving on the no-stop baseline -- not a lone standout. Pass None to disable and "
+                "reproduce the originally-screened, rebalance-only behavior. See the module "
+                "docstring's 'Why a stop-loss' section for the full numbers."
+            )
+        },
+    )
 
     def validate(self) -> None:
         if self.window < 2:
@@ -129,6 +204,8 @@ class IlliquidityTiltConfig(StrategyConfig):
             raise ValueError("top_quantile must be between 0 and 1.")
         if self.rebalance_every_days < 1:
             raise ValueError("rebalance_every_days must be positive.")
+        if self.stop_loss_pct is not None and self.stop_loss_pct <= 0:
+            raise ValueError("stop_loss_pct must be positive (it's a magnitude, e.g. 15.0 means -15%).")
 
 
 @register_strategy("illiquidity_tilt")
@@ -156,14 +233,19 @@ class IlliquidityTiltStrategy(Strategy):
         return f"{self.base_name}_{self.config.window}_{self.config.rebalance_every_days}"
 
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Detect periodic, portfolio-wide rebalance entry/exit events.
+        """Detect periodic, portfolio-wide rebalance events, plus (if
+        ``stop_loss_pct`` is set) per-position stop-loss exits on any day.
 
         Unlike every other strategy in this package, this one maintains a
-        single GLOBAL ``held`` set across the whole date range rather than
-        independent per-symbol state -- a rebalance decision for any one
-        symbol depends on the whole universe's ranking that day, and on
-        whether the strategy itself decided to hold that symbol at the
-        previous rebalance.
+        single GLOBAL ``held`` mapping (symbol -> entry price) across the
+        whole date range rather than independent per-symbol state -- a
+        rebalance decision for any one symbol depends on the whole
+        universe's ranking that day, and on whether the strategy itself
+        decided to hold that symbol at the previous rebalance. The loop
+        below walks every trading day (not just rebalance days) so a
+        stop-loss, when enabled, can fire the day it's triggered rather
+        than waiting for the next scheduled rebalance; rebalance-day logic
+        itself still only runs on the scheduled cadence.
 
         Args:
             df: Merged market data with at least ``required_columns`` for
@@ -172,8 +254,8 @@ class IlliquidityTiltStrategy(Strategy):
                 warmed up.
 
         Returns:
-            Signal rows for rebalance trigger days only, matching
-            ``SIGNAL_OUTPUT_COLUMNS``.
+            Signal rows for rebalance trigger days (and, if enabled,
+            stop-loss trigger days), matching ``SIGNAL_OUTPUT_COLUMNS``.
         """
         if df.empty:
             return pd.DataFrame(columns=list(SIGNAL_OUTPUT_COLUMNS))
@@ -200,19 +282,63 @@ class IlliquidityTiltStrategy(Strategy):
         )
 
         all_dates = sorted(working["date"].unique())
-        rebalance_dates = all_dates[:: cfg.rebalance_every_days]
+        rebalance_dates = set(all_dates[:: cfg.rebalance_every_days])
 
-        held: set[str] = set()
+        # `held` maps symbol -> entry adj_close, needed to check a stop-loss
+        # on any day, not just a rebalance day. When stop_loss_pct is None
+        # the entry prices are tracked but never read -- the behavior is
+        # then identical to before this field existed.
+        held: dict[str, float] = {}
         rows: list[dict[str, object]] = []
 
-        for rebal_date in rebalance_dates:
-            day_df = working.loc[working["date"] == rebal_date, ["symbol", "adj_close", "illiquidity"]]
+        # One pivot for fast same-day price lookups during the daily
+        # stop-loss scan below, instead of filtering `working` on every
+        # date -- built once, O(dates x symbols), not once per date.
+        price_pivot = (
+            working.pivot(index="date", columns="symbol", values="adj_close")
+            if cfg.stop_loss_pct is not None
+            else None
+        )
+
+        for current_date in all_dates:
+            if cfg.stop_loss_pct is not None and held:
+                # Priority: a stop-loss exit always fires before that same
+                # day's scheduled rebalance logic below, mirroring
+                # BollingerReversionStrategy's stop-then-schedule ordering.
+                day_prices = price_pivot.loc[current_date]
+                for symbol in sorted(held):
+                    price = day_prices.get(symbol)
+                    if price is None or pd.isna(price):
+                        continue  # no reading today -- can't evaluate the stop, leave it held
+                    entry_price = held[symbol]
+                    drawdown_pct = (price - entry_price) / entry_price * 100.0
+                    if drawdown_pct <= -cfg.stop_loss_pct:
+                        rows.append(
+                            {
+                                "symbol": symbol,
+                                "date": current_date,
+                                "strategy": self.name,
+                                "signal_type": "SELL",
+                                "price": float(price),
+                                "reason": (
+                                    f"Stop-loss: closed {cfg.stop_loss_pct:.0f}% or more below entry "
+                                    "(Illiquidity Tilt stop)"
+                                ),
+                            }
+                        )
+                        del held[symbol]
+
+            if current_date not in rebalance_dates:
+                continue
+
+            day_df = working.loc[working["date"] == current_date, ["symbol", "adj_close", "illiquidity"]]
             valid = day_df.dropna(subset=["illiquidity"])
             if valid.empty:
                 continue
 
             rank_pct = valid["illiquidity"].rank(pct=True)
             valid_symbols = set(valid["symbol"])
+            held_symbols = set(held)
             target = set(valid.loc[rank_pct >= (1.0 - cfg.top_quantile), "symbol"])
             prices = valid.set_index("symbol")["adj_close"]
 
@@ -222,14 +348,14 @@ class IlliquidityTiltStrategy(Strategy):
             # was, neither force-sold nor re-bought, since there's nothing
             # to rank it against. Restricting to valid_symbols here also
             # guarantees `prices[symbol]` below can never KeyError.
-            to_sell = (held & valid_symbols) - target
-            to_buy = target - held
+            to_sell = (held_symbols & valid_symbols) - target
+            to_buy = target - held_symbols
 
             for symbol in sorted(to_sell):
                 rows.append(
                     {
                         "symbol": symbol,
-                        "date": rebal_date,
+                        "date": current_date,
                         "strategy": self.name,
                         "signal_type": "SELL",
                         "price": float(prices[symbol]),
@@ -243,7 +369,7 @@ class IlliquidityTiltStrategy(Strategy):
                 rows.append(
                     {
                         "symbol": symbol,
-                        "date": rebal_date,
+                        "date": current_date,
                         "strategy": self.name,
                         "signal_type": "BUY",
                         "price": float(prices[symbol]),
@@ -253,7 +379,10 @@ class IlliquidityTiltStrategy(Strategy):
                         ),
                     }
                 )
-            held = (held - to_sell) | to_buy
+            for symbol in to_sell:
+                del held[symbol]
+            for symbol in to_buy:
+                held[symbol] = float(prices[symbol])
 
         if not rows:
             return pd.DataFrame(columns=list(SIGNAL_OUTPUT_COLUMNS))
