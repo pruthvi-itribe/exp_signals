@@ -12,6 +12,8 @@ from strategies.registry import available_strategies, get_strategy, register_str
 # Import concrete strategy modules for their @register_strategy side effect.
 from strategies import (  # noqa: F401
     bollinger_breakout,
+    bollinger_reversion,
+    illiquidity_tilt,
     precision_pullback,
     rsi_mean_reversion,
     sma_crossover,

@@ -227,6 +227,53 @@ def volatility(df: pd.DataFrame, params: dict) -> pd.Series:
     return signal.reindex(df.index)
 
 
+@register_signal("amihud_illiquidity", default_params={"window": 20})
+def amihud_illiquidity(df: pd.DataFrame, params: dict) -> pd.Series:
+    """Rolling average price-impact-per-rupee-traded (the Amihud 2002 illiquidity measure).
+
+    Computed as the N-day rolling mean of ``|daily adj_close return| /
+    (close * volume)`` -- how much the price moves, per rupee of value
+    actually traded, each day. Uses raw ``close`` (not ``adj_close``) for
+    the traded-value denominator, since that's the actual historical price
+    at which that day's volume traded, not a retroactively adjusted one;
+    the return numerator still uses ``adj_close``, matching every other
+    signal in this registry, to avoid a phantom return spike at a stock's
+    own split/bonus dates.
+
+    Hypothesis: a classic, well-documented liquidity premium -- investors
+    demand extra expected return for holding harder-to-trade stocks (a
+    large price move on relatively little traded value signals thin order
+    books and high market-impact cost to exit later), so a HIGHER
+    illiquidity reading should *positively* predict forward returns.
+    Structurally different from every other signal in this registry: this
+    one never looks at price direction or level at all, only how sensitive
+    price is to the rupee volume actually traded that day -- a genuinely
+    different axis, not another momentum/reversal variant wearing a
+    different formula.
+    """
+    window = params.get("window", 20)
+    required = {"symbol", "date", "adj_close", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"amihud_illiquidity requires columns: {sorted(missing)}")
+
+    working = _sorted_working(df)
+    daily_return = working.groupby("symbol")["adj_close"].transform(lambda s: s.pct_change())
+    # float('nan'), not pd.NA: replacing into a float64 Series with pd.NA
+    # upcasts it to object dtype the moment any row has zero traded value
+    # (a real case -- a zero-volume day), which then makes the
+    # .rolling(...).mean() below raise pandas.errors.DataError instead of
+    # quietly propagating NaN (the exact same failure mode this project
+    # already hit once in strategies/trend_ladder.py's _compute_adx).
+    dollar_volume = (working["close"] * working["volume"]).replace(0, float("nan"))
+    daily_illiquidity = daily_return.abs() / dollar_volume
+
+    signal = daily_illiquidity.groupby(working["symbol"]).transform(
+        lambda s: s.rolling(window=window, min_periods=window).mean()
+    )
+    return signal.reindex(df.index)
+
+
 @register_signal("cross_sectional_rank_momentum", default_params={"window": 20})
 def cross_sectional_rank_momentum(df: pd.DataFrame, params: dict) -> pd.Series:
     """Momentum expressed as each stock's percentile rank across the universe that day.

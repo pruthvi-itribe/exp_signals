@@ -34,7 +34,7 @@ from research.signal_library import available_signals, get_signal
 from src.universe import DEFAULT_DB_PATH, get_active_universe
 
 DAILY_TIMEFRAME: str = "1d"
-HORIZON_CHOICES: tuple[str, ...] = ("1d", "5d", "10d", "20d")
+HORIZON_CHOICES: tuple[str, ...] = ("1d", "5d", "10d", "20d", "40d", "60d")
 DEFAULT_OUTPUT_DIR: str = "results/screens"
 
 # Significance requires both a non-trivial sample and a t-stat past the

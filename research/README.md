@@ -23,7 +23,7 @@ would I have made N trading days later?" This is the target variable every
 signal gets correlated against.
 
 - **`forward_returns` table** — one row per `(symbol, date)`, columns
-  `fwd_return_1d`, `fwd_return_5d`, `fwd_return_10d`, `fwd_return_20d`.
+  `fwd_return_1d`, `fwd_return_5d`, `fwd_return_10d`, `fwd_return_20d`, `fwd_return_40d`, `fwd_return_60d`.
 - **`compute_forward_returns(df, horizons=[1,5,10,20])`** — per symbol, sorted
   by date, `fwd_return_Nd[T] = adj_close[T+N] / adj_close[T] - 1`, where
   `T+N` means N *trading days* ahead (via `.shift(-N)`), never N calendar
@@ -57,6 +57,7 @@ be pre-computed and stored.
 | `bb_position` | `window=20, num_std=2.0` | `(price − lower band) / (upper − lower)`, 0=lower band, 1=upper band | tests whether "how stretched is price" predicts reversal or continuation — lets the data decide which |
 | `volatility` | `window=20` | rolling N-day std of daily returns | could be a risk premium (positive) or distress signal (negative) — the screen tells you which dominates |
 | `cross_sectional_rank_momentum` | `window=20` | same as `momentum`, but expressed as each stock's 0–1 percentile rank *among all symbols on that date* | strips out market-wide moves, tests purely relative attractiveness |
+| `amihud_illiquidity` | `window=20` | rolling N-day mean of `\|daily adj_close return\| / (close × volume)` — price move per rupee actually traded | the liquidity premium: investors demand extra return for harder-to-trade stocks. Structurally different from every signal above — never looks at price direction/level at all, only price-impact-per-rupee-traded |
 
 Look up a signal with `get_signal("momentum")`, which returns a `SignalSpec`
 you call as `spec(df, params)`. List all registered names with
@@ -135,7 +136,7 @@ python -m research.screen batch --help
 
 ```
 python -m research.screen run --signal SIGNAL [--params "k=v,k2=v2"]
-    [--horizon {1d,5d,10d,20d}] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
+    [--horizon {1d,5d,10d,20d,40d,60d}] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
     [--universe nifty50|SYM1,SYM2,...] [--output-dir DIR]
     [--method {spearman,pearson}]
 ```
@@ -182,7 +183,7 @@ files to `--output-dir`:
 
 ```
 python -m research.screen batch --signals SIG1,SIG2,...
-    [--horizon {1d,5d,10d,20d}] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
+    [--horizon {1d,5d,10d,20d,40d,60d}] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
     [--universe nifty50|SYM1,SYM2,...] [--output-dir DIR]
     [--method {spearman,pearson}]
 ```

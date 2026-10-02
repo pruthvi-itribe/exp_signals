@@ -13,6 +13,7 @@ import pytest
 
 from research.signal_library import (
     SignalSpec,
+    amihud_illiquidity,
     available_signals,
     bb_position,
     cross_sectional_rank_momentum,
@@ -39,6 +40,13 @@ def _panel(symbol_series: dict[str, list[float]], volumes: dict[str, list[float]
     return pd.concat(frames, ignore_index=True)
 
 
+def _illiq_panel(adj_close: list[float], close: list[float], volume: list[float], symbol: str = "AAA") -> pd.DataFrame:
+    """Build a single-symbol panel with independently-settable adj_close/close/volume,
+    for amihud_illiquidity (the only signal here needing both price columns)."""
+    dates = pd.date_range("2024-01-01", periods=len(adj_close), freq="D")
+    return pd.DataFrame({"symbol": symbol, "date": dates, "adj_close": adj_close, "close": close, "volume": volume})
+
+
 # ---------------------------------------------------------------------------
 # Registry mechanics (same pattern as strategies.registry)
 # ---------------------------------------------------------------------------
@@ -57,6 +65,7 @@ def test_available_signals_includes_all_builtins():
         "bb_position",
         "volatility",
         "cross_sectional_rank_momentum",
+        "amihud_illiquidity",
     ):
         assert expected in names
 
@@ -328,3 +337,76 @@ def test_cross_sectional_rank_momentum_tie_gets_average_rank():
     assert day2["AAA"] == pytest.approx(0.75)
     assert day2["BBB"] == pytest.approx(0.75)
     assert day2["AAA"] == day2["BBB"]
+
+
+# ---------------------------------------------------------------------------
+# amihud_illiquidity
+# ---------------------------------------------------------------------------
+
+
+def test_amihud_illiquidity_missing_columns_raises():
+    """Would catch the required-columns guard silently disappearing -- this
+    signal needs adj_close (for the return), AND close + volume (for the
+    traded-value denominator), unlike every other signal here which only
+    needs adj_close (+volume for volume_weighted_momentum)."""
+    df = _panel({"AAA": [100.0, 101.0, 102.0]})  # no close, no volume
+    with pytest.raises(ValueError, match="amihud_illiquidity requires columns"):
+        amihud_illiquidity(df, {"window": 2})
+
+
+def test_amihud_illiquidity_hand_computed_value():
+    """window=2 on a 4-point series with adj_close==close (no corporate
+    action, so the hand calculation isn't complicated by the return/value
+    basis differing): daily_illiquidity = |pct_change| / (close*volume) at
+    each point, then a rolling mean. Would catch the return/value ratio
+    being inverted (illiquidity *decreasing* with bigger moves instead of
+    increasing), or dollar volume computed from adj_close instead of raw
+    close.
+    """
+    df = _illiq_panel(
+        adj_close=[100.0, 110.0, 121.0, 100.0],
+        close=[100.0, 110.0, 121.0, 100.0],
+        volume=[1000.0, 1000.0, 2000.0, 1000.0],
+    )
+    result = amihud_illiquidity(df, {"window": 2})
+
+    assert result.iloc[:2].isna().all()  # index0: no return yet; index1: window needs 2 valid points
+    assert result.iloc[2] == pytest.approx(6.61157024793389e-07, rel=1e-9)
+    assert result.iloc[3] == pytest.approx(1.0743801652892562e-06, rel=1e-9)
+
+
+def test_amihud_illiquidity_zero_dollar_volume_is_nan_not_crash():
+    """A zero-volume day makes dollar_volume zero -- the `.replace(0, pd.NA)`
+    guard means this resolves to NaN (and keeps propagating as NaN through
+    the rolling mean) rather than raising a ZeroDivisionError or producing
+    an infinite value."""
+    df = _illiq_panel(
+        adj_close=[100.0, 110.0, 99.0],
+        close=[100.0, 110.0, 99.0],
+        volume=[1000.0, 0.0, 1000.0],  # zero volume on day 1
+    )
+    result = amihud_illiquidity(df, {"window": 2})
+    assert pd.isna(result.iloc[1])  # the zero-volume day's own illiquidity is NaN
+    assert pd.isna(result.iloc[2])  # and it poisons the window that includes it (min_periods=2)
+
+
+def test_amihud_illiquidity_higher_price_impact_gives_higher_reading():
+    """A day with a big price move on thin volume must score HIGHER
+    illiquidity than a day with the same-sized move on heavy volume --
+    would catch a formula that doesn't actually scale inversely with
+    traded value."""
+    thin = _illiq_panel(
+        adj_close=[100.0, 110.0],
+        close=[100.0, 110.0],
+        volume=[100.0, 100.0],
+        symbol="THIN",
+    )
+    heavy = _illiq_panel(
+        adj_close=[100.0, 110.0],
+        close=[100.0, 110.0],
+        volume=[100.0, 100000.0],
+        symbol="HEAVY",
+    )
+    thin_val = amihud_illiquidity(thin, {"window": 1}).iloc[1]
+    heavy_val = amihud_illiquidity(heavy, {"window": 1}).iloc[1]
+    assert thin_val > heavy_val

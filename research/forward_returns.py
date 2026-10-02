@@ -20,14 +20,20 @@ import pandas as pd
 from src.universe import DEFAULT_DB_PATH, get_active_universe
 
 DAILY_TIMEFRAME: str = "1d"
-DEFAULT_HORIZONS: list[int] = [1, 5, 10, 20]
+DEFAULT_HORIZONS: list[int] = [1, 5, 10, 20, 40, 60]
 FORWARD_RETURN_COLUMNS: tuple[str, ...] = tuple(f"fwd_return_{h}d" for h in DEFAULT_HORIZONS)
 
 StoreSummary = dict[str, int]
 
 
 def ensure_forward_returns_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create the ``forward_returns`` table if it does not already exist."""
+    """Create the ``forward_returns`` table if it does not already exist.
+
+    ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` also runs every time (same
+    pattern as ``src.storage.upsert.ensure_ohlcv_upsert_schema``) so a table
+    created before ``fwd_return_40d``/``fwd_return_60d`` existed gets them
+    added in place, rather than needing a fresh table.
+    """
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS forward_returns (
@@ -42,6 +48,8 @@ def ensure_forward_returns_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    conn.execute("ALTER TABLE forward_returns ADD COLUMN IF NOT EXISTS fwd_return_40d DOUBLE")
+    conn.execute("ALTER TABLE forward_returns ADD COLUMN IF NOT EXISTS fwd_return_60d DOUBLE")
 
 
 def compute_forward_returns(df: pd.DataFrame, horizons: list[int] | None = None) -> pd.DataFrame:
@@ -63,10 +71,10 @@ def compute_forward_returns(df: pd.DataFrame, horizons: list[int] | None = None)
             Should include a symbol's full available history (not just a
             screening window) so later horizons aren't truncated.
         horizons: Trading-day horizons to compute. Defaults to
-            ``DEFAULT_HORIZONS`` (``[1, 5, 10, 20]``) — the columns
+            ``DEFAULT_HORIZONS`` (``[1, 5, 10, 20, 40, 60]``) — the columns
             ``forward_returns`` has room for. Other horizons can be
             computed here for ad-hoc/in-memory use, but ``store_forward_returns``
-            can only persist the four default ones.
+            can only persist the six default ones.
 
     Returns:
         DataFrame with ``symbol``, ``date``, and one ``fwd_return_{h}d``
@@ -98,7 +106,7 @@ def store_forward_returns(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> 
     """Upsert computed forward returns into ``forward_returns``.
 
     Uses the same insert-on-conflict-update pattern as ``indicators.store_indicators``.
-    ``df`` may omit some of the four ``fwd_return_*d`` columns (stored as
+    ``df`` may omit some of the six ``fwd_return_*d`` columns (stored as
     NULL) but must not contain any ``fwd_return_*d`` column outside
     ``FORWARD_RETURN_COLUMNS`` — the table has no room for arbitrary horizons.
 

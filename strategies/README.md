@@ -3,7 +3,7 @@
 Each concrete strategy is a `Strategy` subclass (`strategies/base.py`) registered
 under a string name (`strategies/registry.py`). See `ARCHITECTURE.md` for the
 full module-by-module reference and dependency map; this file is specifically
-about **fidelity to source specs** — two of the five registered strategies
+about **fidelity to source specs** — two of the seven registered strategies
 (`trend_ladder`, `precision_pullback`) were ported from external PDF write-ups
 that include their own published backtest, and each has parts of the written
 strategy that are *deliberately not implemented*. This is the single place
@@ -12,6 +12,32 @@ silently assumed away when reading a backtest result off this repo's data —
 each is also documented in its strategy's own module docstring, but this file
 is the one to check first if you're comparing a run here against a source
 spec's published numbers.
+
+## `bollinger_reversion` and `illiquidity_tilt` — not ported from a source spec, so not in the tables below
+
+Unlike the other five, these two weren't ported from an external write-up
+— both were built directly from `research/screen.py` findings (see each
+one's own module docstring for its full validation trail: `bollinger_reversion`'s
+horizon/window sweeps and large-cap-vs-rest split; `illiquidity_tilt`'s
+exclude-the-winners and Nifty-500-dilution checks on `amihud_illiquidity`).
+There's no external "published" number to compare against or omit from, so
+neither has anything to add to the fidelity-tracking tables below.
+
+Both are also architecturally different from the five ported/hand-written
+strategies — cross-sectional, relative-value rules rather than a per-symbol
+price-pattern trigger — which each one's own docstring covers in detail,
+including why running either against a single symbol, or against a
+universe wider than the one it was validated on (Nifty 50 for both), either
+silently produces a meaningless result (`bollinger_reversion`, a single
+symbol never buys) or the opposite (`illiquidity_tilt`, a single symbol
+*always* buys) rather than an error either way.
+
+`illiquidity_tilt` is also architecturally different from `bollinger_reversion`
+specifically: it rebalances the whole portfolio together on a fixed
+calendar-like schedule (driven by one global `held` set) rather than
+running independent per-symbol opportunistic entry/exit cycles — a
+deliberate match to what screening found (near-zero day-to-day turnover in
+the underlying signal's own ranking), not an arbitrary design choice.
 
 ## Why omissions happen at all
 
