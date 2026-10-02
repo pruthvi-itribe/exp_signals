@@ -135,7 +135,8 @@ def store_signals(
     """Upsert signal rows into the ``signals`` table.
 
     Conflicts on ``(symbol, date, strategy)`` update signal fields and
-    refresh ``generated_at``.
+    refresh ``generated_at``. Rows not in ``signals_df`` are left as they
+    are; use ``replace_signals`` to make the stored set match a fresh run.
 
     Args:
         conn: Open DuckDB connection.
@@ -144,73 +145,144 @@ def store_signals(
     Returns:
         Summary with ``signals_inserted``, ``buy_count``, and ``sell_count``.
     """
+    return _write_signals(conn, signals_df, replace=None)
+
+
+def replace_signals(
+    conn: duckdb.DuckDBPyConnection,
+    strategy_name: str,
+    symbols: list[str] | None,
+    signals_df: pd.DataFrame,
+) -> StoreSignalsSummary:
+    """Replace one strategy's stored signals for ``symbols`` with ``signals_df``.
+
+    ``symbols=None`` replaces every stored row of the strategy, whatever its
+    symbol (e.g. a run over the whole active universe, so constituents that
+    have since left it do not keep stale signals).
+
+    In one transaction, deletes every stored row for ``strategy_name`` on
+    those symbols, then writes ``signals_df``. Without the delete, a signal a
+    re-run no longer emits (changed code or parameters under the same
+    strategy name) would stay in the table and feed every later backtest.
+    Other strategies' rows, and this strategy's rows for other symbols, are
+    untouched.
+
+    Raises:
+        ValueError: if ``signals_df`` has rows for another strategy or for a
+            symbol outside ``symbols`` (those would be written without their
+            stale rows ever being removed).
+    """
+    if not signals_df.empty:
+        if set(signals_df["strategy"]) != {strategy_name}:
+            raise ValueError(f"replace_signals: every row's strategy must be '{strategy_name}'.")
+        outside = set(signals_df["symbol"]) - set(symbols) if symbols is not None else set()
+        if outside:
+            raise ValueError(f"replace_signals: rows for symbol(s) outside the replaced set: {sorted(outside)}.")
+    return _write_signals(conn, signals_df, replace=(strategy_name, symbols))
+
+
+def _write_signals(
+    conn: duckdb.DuckDBPyConnection,
+    signals_df: pd.DataFrame,
+    replace: tuple[str, list[str] | None] | None,
+) -> StoreSignalsSummary:
+    """Shared write path: optional scoped delete, then upsert, in one transaction."""
     empty_summary: StoreSignalsSummary = {
         "signals_inserted": 0,
         "buy_count": 0,
         "sell_count": 0,
     }
-    if signals_df.empty:
+    if signals_df.empty and replace is None:
         return empty_summary
 
     ensure_signals_schema(conn)
-    staging = _prepare_signal_staging(signals_df)
-    buy_count = int((staging["signal_type"] == "BUY").sum())
-    sell_count = int((staging["signal_type"] == "SELL").sum())
+    staging = None if signals_df.empty else _prepare_signal_staging(signals_df)
 
-    conn.register("_signal_staging", staging)
+    if staging is not None:
+        conn.register("_signal_staging", staging)
     try:
         conn.execute("BEGIN TRANSACTION")
         try:
-            rows_updated = conn.execute(
-                """
-                SELECT COUNT(*)::BIGINT
-                FROM _signal_staging AS staging
-                INNER JOIN signals AS existing
-                    ON staging.symbol = existing.symbol
-                   AND staging.date = existing.date
-                   AND staging.strategy = existing.strategy
-                """
-            ).fetchone()[0]
+            if replace is not None:
+                strategy_name, symbols = replace
+                if symbols is None or symbols:
+                    # Delete only rows the new run does not rewrite; rewritten keys
+                    # are updated by the upsert below. Deleting a key and inserting
+                    # it again in the same transaction silently loses the new row on
+                    # DuckDB < 1.2 (verified on 1.0.0 and 1.1.3).
+                    symbol_scope = (
+                        f"AND symbol IN ({', '.join('?' for _ in symbols)})" if symbols is not None else ""
+                    )
+                    rewritten = (
+                        """
+                        AND NOT EXISTS (
+                            SELECT 1 FROM _signal_staging AS staging
+                            WHERE staging.symbol = signals.symbol
+                              AND staging.date = signals.date
+                              AND staging.strategy = signals.strategy
+                        )
+                        """
+                        if staging is not None
+                        else ""
+                    )
+                    conn.execute(
+                        f"DELETE FROM signals WHERE strategy = ? {symbol_scope} {rewritten}",
+                        [strategy_name, *(symbols or [])],
+                    )
+            rows_updated = 0
+            if staging is not None:
+                rows_updated = conn.execute(
+                    """
+                    SELECT COUNT(*)::BIGINT
+                    FROM _signal_staging AS staging
+                    INNER JOIN signals AS existing
+                        ON staging.symbol = existing.symbol
+                       AND staging.date = existing.date
+                       AND staging.strategy = existing.strategy
+                    """
+                ).fetchone()[0]
 
-            conn.execute(
-                """
-                INSERT INTO signals (
-                    symbol,
-                    date,
-                    strategy,
-                    signal_type,
-                    price,
-                    reason,
-                    generated_at
+                conn.execute(
+                    """
+                    INSERT INTO signals (
+                        symbol,
+                        date,
+                        strategy,
+                        signal_type,
+                        price,
+                        reason,
+                        generated_at
+                    )
+                    SELECT
+                        symbol,
+                        date,
+                        strategy,
+                        signal_type,
+                        price,
+                        reason,
+                        generated_at
+                    FROM _signal_staging
+                    ON CONFLICT (symbol, date, strategy) DO UPDATE SET
+                        signal_type = excluded.signal_type,
+                        price = excluded.price,
+                        reason = excluded.reason,
+                        generated_at = excluded.generated_at
+                    """
                 )
-                SELECT
-                    symbol,
-                    date,
-                    strategy,
-                    signal_type,
-                    price,
-                    reason,
-                    generated_at
-                FROM _signal_staging
-                ON CONFLICT (symbol, date, strategy) DO UPDATE SET
-                    signal_type = excluded.signal_type,
-                    price = excluded.price,
-                    reason = excluded.reason,
-                    generated_at = excluded.generated_at
-                """
-            )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
     finally:
-        conn.unregister("_signal_staging")
+        if staging is not None:
+            conn.unregister("_signal_staging")
 
-    signals_inserted = len(staging) - int(rows_updated)
+    if staging is None:
+        return empty_summary
     return {
-        "signals_inserted": signals_inserted,
-        "buy_count": buy_count,
-        "sell_count": sell_count,
+        "signals_inserted": len(staging) - int(rows_updated),
+        "buy_count": int((staging["signal_type"] == "BUY").sum()),
+        "sell_count": int((staging["signal_type"] == "SELL").sum()),
     }
 
 
@@ -221,13 +293,21 @@ def run_strategy(
 ) -> StoreSignalsSummary:
     """Load data, generate signals, persist them, and print a run summary.
 
+    The strategy's stored signals are replaced, not merged: for an explicit
+    ``symbols`` list, every listed symbol with input rows; with
+    ``symbols=None`` (the whole active universe), every stored row of the
+    strategy. Rows for a listed symbol with no input rows at all are left as
+    they are, and so are rows from runs over other symbol lists, so for a
+    cross-sectional strategy run on several universes the table holds each
+    symbol's latest ranking, not one run's.
+
     Args:
         conn: Open DuckDB connection.
         strategy: Strategy instance to evaluate.
         symbols: Optional symbol filter. Defaults to active universe.
 
     Returns:
-        Store summary from ``store_signals``.
+        Write summary from ``replace_signals``.
     """
     input_df = load_strategy_input(conn, symbols=symbols)
     if input_df.empty:
@@ -235,7 +315,10 @@ def run_strategy(
         return {"signals_inserted": 0, "buy_count": 0, "sell_count": 0}
 
     signals_df = strategy.generate_signals(input_df)
-    summary = store_signals(conn, signals_df)
+    # symbols=None means "the whole active universe": replace every stored row
+    # of the strategy, so a symbol that has left the universe loses its signals.
+    covered_symbols = None if symbols is None else sorted(input_df["symbol"].unique().tolist())
+    summary = replace_signals(conn, strategy.name, covered_symbols, signals_df)
 
     symbol_count = input_df["symbol"].nunique()
     print(f"\nStrategy run: {strategy.name}")

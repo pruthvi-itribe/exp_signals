@@ -7,6 +7,7 @@ strategy-input join that includes ohlcv rows with no matching indicator row
 on empty input instead of degrading gracefully.
 """
 
+import duckdb
 import pandas as pd
 import pytest
 
@@ -16,6 +17,7 @@ from src.strategy import (
     _prepare_signal_staging,
     _resolve_symbols,
     load_strategy_input,
+    replace_signals,
     run_strategy,
     store_signals,
     summarize_signals,
@@ -248,6 +250,134 @@ def test_run_strategy_full_flow_persists_signals(capsys):
     assert len(stored) == 1
     assert stored.iloc[0]["signal_type"] == "BUY"
     assert "Signals emitted: 1" in capsys.readouterr().out
+    conn.close()
+
+
+def _signal(symbol: str, date: str, signal_type: str, strategy: str = "fixed_test_strategy") -> dict[str, object]:
+    """One signal row in SIGNAL_OUTPUT_COLUMNS shape."""
+    return {"symbol": symbol, "date": date, "strategy": strategy,
+            "signal_type": signal_type, "price": 100.0, "reason": "test"}
+
+
+def _seed_two_days(conn: duckdb.DuckDBPyConnection, symbols: tuple[str, ...] = ("AAA",)) -> None:
+    """Two days of OHLCV + indicator rows per symbol, so load_strategy_input returns them."""
+    ensure_indicators_schema(conn)
+    for symbol in symbols:
+        insert_ohlcv(conn, symbol, [("2024-01-01", 100, 102), ("2024-01-02", 102, 101)])
+        _insert_indicator_row(conn, symbol, "2024-01-01")
+        _insert_indicator_row(conn, symbol, "2024-01-02")
+
+
+def test_rerun_drops_signals_the_strategy_no_longer_emits(capsys):
+    """Run 1 emits BUY 01-01 and SELL 01-02; run 2 (changed code or params,
+    same strategy name) emits only the BUY. The backtest reads whatever is
+    stored for the strategy, so the stale SELL must not survive run 2.
+
+    Would catch: an upsert-only write path, where a signal the strategy no
+    longer produces stays in the table and silently feeds every later
+    backtest of that strategy.
+    """
+    conn = make_conn()
+    _seed_two_days(conn)
+    run_strategy(conn, _FixedSignalStrategy(pd.DataFrame(
+        [_signal("AAA", "2024-01-01", "BUY"), _signal("AAA", "2024-01-02", "SELL")])), symbols=["AAA"])
+    run_strategy(conn, _FixedSignalStrategy(pd.DataFrame(
+        [_signal("AAA", "2024-01-01", "BUY")])), symbols=["AAA"])
+
+    stored = conn.execute("SELECT symbol, date::VARCHAR AS d, signal_type FROM signals ORDER BY d").fetchall()
+    assert stored == [("AAA", "2024-01-01", "BUY")]
+    conn.close()
+
+
+def test_rerun_with_no_signals_clears_the_previous_ones(capsys):
+    """Would catch: the replacement being skipped when the new run emits
+    nothing at all, leaving the whole previous run's signals in place."""
+    conn = make_conn()
+    _seed_two_days(conn)
+    run_strategy(conn, _FixedSignalStrategy(pd.DataFrame([_signal("AAA", "2024-01-01", "BUY")])), symbols=["AAA"])
+    run_strategy(conn, _FixedSignalStrategy(), symbols=["AAA"])
+
+    assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
+    conn.close()
+
+
+def test_rerun_keeps_other_strategies_and_symbols_it_did_not_run(capsys):
+    """Replacement is scoped to (this strategy, the symbols this run
+    covered). Another strategy's rows, and this strategy's rows for a symbol
+    not in this run, must stay.
+
+    Would catch: a replacement that wipes the whole signals table or every
+    symbol of the strategy, destroying unrelated stored results.
+    """
+    conn = make_conn()
+    _seed_two_days(conn, symbols=("AAA", "BBB"))
+    insert_signal(conn, "AAA", "2024-01-01", "other_strategy", "BUY")
+    run_strategy(conn, _FixedSignalStrategy(pd.DataFrame(
+        [_signal("AAA", "2024-01-01", "BUY"), _signal("BBB", "2024-01-01", "BUY")])), symbols=["AAA", "BBB"])
+    run_strategy(conn, _FixedSignalStrategy(), symbols=["AAA"])
+
+    stored = conn.execute("SELECT symbol, strategy FROM signals ORDER BY symbol, strategy").fetchall()
+    assert stored == [("AAA", "other_strategy"), ("BBB", "fixed_test_strategy")]
+    conn.close()
+
+
+def test_rerun_over_the_whole_universe_drops_symbols_that_left_it(monkeypatch, capsys):
+    """With symbols=None the run covers the active universe as a whole, so a
+    symbol that has since left the universe must not keep its old signals
+    (run_backtest with symbols=None reads every symbol that has signals).
+
+    Would catch: replacement scoped only to the symbols that had input rows,
+    leaving a removed constituent's stale signals to be traded.
+    """
+    conn = make_conn()
+    _seed_two_days(conn, symbols=("AAA", "OLD"))
+    monkeypatch.setattr(strategy_mod, "get_active_universe", lambda conn: ["AAA.NS", "OLD.NS"])
+    run_strategy(conn, _FixedSignalStrategy(pd.DataFrame(
+        [_signal("AAA", "2024-01-01", "BUY"), _signal("OLD", "2024-01-01", "BUY")])))
+    monkeypatch.setattr(strategy_mod, "get_active_universe", lambda conn: ["AAA.NS"])
+    run_strategy(conn, _FixedSignalStrategy(pd.DataFrame([_signal("AAA", "2024-01-01", "BUY")])))
+
+    assert conn.execute("SELECT symbol FROM signals ORDER BY symbol").fetchall() == [("AAA",)]
+    conn.close()
+
+
+def test_failed_replace_keeps_the_previous_signals():
+    """The delete and the write share one transaction: if the write fails,
+    the strategy's previous signals must still be there.
+
+    Would catch: the delete running outside the write's transaction (e.g.
+    autocommitted before it), which would leave a strategy with no stored
+    signals after a failed re-run.
+    """
+    conn = make_conn()
+    store_signals(conn, pd.DataFrame([_signal("AAA", "2024-01-01", "BUY")]))
+    bad = pd.DataFrame([_signal("AAA", "2024-01-02", "SELL")])
+    bad["date"] = pd.NaT  # violates signals.date NOT NULL inside the transaction
+
+    with pytest.raises(Exception):
+        replace_signals(conn, "fixed_test_strategy", ["AAA"], bad)
+
+    assert conn.execute("SELECT symbol, date::VARCHAR, signal_type FROM signals").fetchall() == [
+        ("AAA", "2024-01-01", "BUY")
+    ]
+    conn.close()
+
+
+def test_replace_signals_rejects_rows_outside_its_scope():
+    """replace_signals deletes (strategy, symbols) and writes signals_df in
+    one go, so rows for another strategy or an uncovered symbol would be
+    written without their stale counterparts ever being removed.
+
+    Would catch: a caller passing mismatched arguments silently mixing a
+    replace with a plain upsert.
+    """
+    conn = make_conn()
+    other_strategy = pd.DataFrame([_signal("AAA", "2024-01-01", "BUY", strategy="other")])
+    with pytest.raises(ValueError, match="strategy"):
+        replace_signals(conn, "fixed_test_strategy", ["AAA"], other_strategy)
+    uncovered = pd.DataFrame([_signal("BBB", "2024-01-01", "BUY")])
+    with pytest.raises(ValueError, match="symbol"):
+        replace_signals(conn, "fixed_test_strategy", ["AAA"], uncovered)
     conn.close()
 
 
