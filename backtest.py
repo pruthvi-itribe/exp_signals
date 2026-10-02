@@ -12,17 +12,28 @@ from src.universe import get_active_universe
 
 DEFAULT_DB_PATH: Path = Path("data/trading_data.duckdb")
 
+# Flat depository (DP) charge per delivery SELL, before GST. Broker-dependent:
+# Rs 20 is Upstox's (FY2026-27); other brokers charge roughly Rs 13-20. Being
+# flat, it weighs more on small positions.
+DP_CHARGE_PER_SELL: float = 20.0
+
 def calculate_transaction_cost(trade_value: float, side: str) -> float:
     """
     Calculate approximate transaction costs for Indian equity delivery trades.
     
-    Rates used (approximate as of recent NSE/SEBI rules):
-    - Brokerage: ₹0 for delivery (common for discount brokers)
+    Rates used (checked 2026-10 against Upstox's own brokerage calculator,
+    GET /v2/charges/brokerage, for NSE equity delivery on one account):
+    - Brokerage: ₹0 for delivery (that account's plan; many brokers, Upstox's
+      standard tariff included, charge a per-order fee, which this omits)
     - STT: 0.1% on both buy and sell
-    - Exchange Transaction Charges: ~0.00345%
+    - Exchange Transaction Charges: 0.00307% (NSE 0.00297% + IPFT 0.0001%;
+      today's rate, applied to every year of a backtest)
     - SEBI Charges: ₹10 per crore (0.0001%)
     - Stamp Duty: 0.015% on buy side only
-    - GST: 18% on (Brokerage + Exchange Charges)
+    - DP (depository) charge: flat Rs 20 per delivery SELL (broker-dependent;
+      Rs 20 is a measured Upstox FY2026-27 figure)
+    - GST: 18% on (Brokerage + Exchange Charges + SEBI Charges + DP charge),
+      which reproduces a real Upstox contract-note GST total
     
     NOTE: These rates change periodically and should be verified against 
     current broker and SEBI schedules.
@@ -31,7 +42,7 @@ def calculate_transaction_cost(trade_value: float, side: str) -> float:
     
     brokerage = 0.0
     stt_rate = 0.001
-    exchange_rate = 0.0000345
+    exchange_rate = 0.0000307
     sebi_rate = 0.000001
     stamp_duty_rate = 0.00015
     gst_rate = 0.18
@@ -39,12 +50,13 @@ def calculate_transaction_cost(trade_value: float, side: str) -> float:
     stt = trade_value * stt_rate
     exchange_charges = trade_value * exchange_rate
     sebi_charges = trade_value * sebi_rate
+    dp_charge = DP_CHARGE_PER_SELL if side == 'SELL' else 0.0
     
-    gst = (brokerage + exchange_charges) * gst_rate
+    gst = (brokerage + exchange_charges + sebi_charges + dp_charge) * gst_rate
     
     stamp_duty = (trade_value * stamp_duty_rate) if side == 'BUY' else 0.0
     
-    total_cost = brokerage + stt + exchange_charges + sebi_charges + gst + stamp_duty
+    total_cost = brokerage + stt + exchange_charges + sebi_charges + dp_charge + gst + stamp_duty
     return total_cost
 
 def calculate_metrics(
@@ -301,6 +313,22 @@ def _schedule_executions(
     return scheduled
 
 
+def _affordable_quantity(budget: float, fill_price: float) -> int:
+    """Largest whole-share quantity whose value plus buy-side costs fits ``budget``.
+
+    Starts from the proportional estimate at the budget's own size, then steps
+    down until the real cost of the actual order fits, so a flat (non
+    proportional) fee can never make the debit exceed the budget.
+    """
+    if budget <= 0 or fill_price <= 0:
+        return 0
+    cost_rate = calculate_transaction_cost(budget, "BUY") / budget
+    quantity = int(budget // (fill_price * (1 + cost_rate)))
+    while quantity > 0 and quantity * fill_price + calculate_transaction_cost(quantity * fill_price, "BUY") > budget:
+        quantity -= 1
+    return quantity
+
+
 def _close_position(
     trades: list[dict[str, object]],
     symbol: str,
@@ -390,8 +418,7 @@ def _simulate(
 
                 fill_price = open_price * (1 + slippage_frac)
                 budget = min(prior_equity / max_concurrent_positions, cash)
-                cost_rate = calculate_transaction_cost(fill_price, "BUY") / fill_price
-                quantity = int(budget // (fill_price * (1 + cost_rate)))
+                quantity = _affordable_quantity(budget, fill_price)
                 if quantity < 1:
                     skipped += 1
                     continue
@@ -565,7 +592,9 @@ def run_backtest(
     ``equity / max_concurrent_positions``, with equity marked at the previous
     close (``initial_capital`` on the first day), capped by available cash,
     and buys as many whole shares as that budget affords including buy-side
-    costs. A BUY signal is skipped (not queued, not retried) if the
+    costs. When cash is short of the target, the entry is sized to the cash
+    left, so it can be much smaller than its peers (down to one share) and
+    still occupies a slot. A BUY signal is skipped (not queued, not retried) if the
     symbol already has an open position, ``max_concurrent_positions`` is
     already reached, or the allocation can't cover even one share. A SELL
     signal for a symbol with no open position is ignored.

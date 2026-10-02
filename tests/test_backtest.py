@@ -168,43 +168,42 @@ def test_t_plus_1_execution_timing(monkeypatch):
 
 
 def test_transaction_cost_calculation():
-    """calculate_transaction_cost() matches its own documented STT/exchange/
-    SEBI/GST/stamp-duty formula exactly, for both BUY and SELL.
+    """calculate_transaction_cost() reproduces a broker's own numbers, not a
+    restatement of its own formula.
 
-    Would catch: a wrong rate constant, GST computed on the wrong base,
-    stamp duty leaking into SELL trades (or missing from BUY trades -- it is
-    documented as buy-side only), or a case-sensitive side check.
+    Expected totals come from Upstox's brokerage calculator (GET
+    /v2/charges/brokerage, NSE equity delivery, queried 2026-10) for the
+    exact trade values below, plus the depository (DP) charge that the
+    calculator lists separately as a flat Rs 20 per delivery sell. GST also
+    applies to DP: a real FY2026-27 Upstox equity contract note's GST (96.41)
+    equals 18% of transaction + SEBI + DP + brokerage. So every SELL adds
+    20 * 1.18 = 23.60 to the calculator's total.
+
+    Would catch: a stale exchange rate, GST on the wrong base, stamp duty on
+    SELLs or missing from BUYs, a missing or BUY-side DP charge, or a
+    case-sensitive side check.
     """
-    # Hand-computed expected values (trade_value * rate, summed per the
-    # docstring's formula):
-    #   BUY  100000: stt=100 + exch=3.45 + sebi=0.1 + gst=0.621 + stamp=15   = 119.171
-    #   SELL 100000: stt=100 + exch=3.45 + sebi=0.1 + gst=0.621 + stamp=0    = 104.171
-    #   BUY   50000: stt=50  + exch=1.725+ sebi=0.05+ gst=0.3105+ stamp=7.5  =  59.5855
-    #   SELL  50000: stt=50  + exch=1.725+ sebi=0.05+ gst=0.3105+ stamp=0    =  52.0855
-    assert calculate_transaction_cost(100_000.0, "BUY") == pytest.approx(119.171, rel=1e-9)
-    assert calculate_transaction_cost(100_000.0, "SELL") == pytest.approx(104.171, rel=1e-9)
-    assert calculate_transaction_cost(50_000.0, "BUY") == pytest.approx(59.5855, rel=1e-9)
-    assert calculate_transaction_cost(50_000.0, "SELL") == pytest.approx(52.0855, rel=1e-9)
-
-    # Independent reference implementation of the same documented formula,
-    # cross-checked against a wider set of trade values.
-    def expected_cost(trade_value: float, side: str) -> float:
-        stt = trade_value * 0.001
-        exchange_charges = trade_value * 0.0000345
-        sebi_charges = trade_value * 0.000001
-        gst = exchange_charges * 0.18  # brokerage is 0
-        stamp_duty = trade_value * 0.00015 if side == "BUY" else 0.0
-        return stt + exchange_charges + sebi_charges + gst + stamp_duty
-
-    for trade_value in (1_000.0, 25_000.0, 250_000.0, 1_000_000.0):
-        for side in ("BUY", "SELL"):
-            assert calculate_transaction_cost(trade_value, side) == pytest.approx(
-                expected_cost(trade_value, side), rel=1e-9
-            )
+    dp_with_gst = 20.0 * 1.18
+    broker_quotes = [
+        # (trade_value, side, Upstox calculator total excluding DP)
+        (1_000.0, "SELL", 1.04),
+        (50_000.0, "BUY", 59.38),
+        (50_000.0, "SELL", 51.88),
+        (100_000.0, "BUY", 118.74),
+        (100_000.0, "SELL", 103.74),
+        (1_000_000.0, "SELL", 1037.41),
+    ]
+    for trade_value, side, broker_total in broker_quotes:
+        expected = broker_total + (dp_with_gst if side == "SELL" else 0.0)
+        # The calculator rounds each component to the paisa.
+        assert calculate_transaction_cost(trade_value, side) == pytest.approx(expected, abs=0.02)
 
     # side must not be case-sensitive.
     assert calculate_transaction_cost(100_000.0, "buy") == pytest.approx(
         calculate_transaction_cost(100_000.0, "BUY")
+    )
+    assert calculate_transaction_cost(100_000.0, "sell") == pytest.approx(
+        calculate_transaction_cost(100_000.0, "SELL")
     )
 
 
@@ -382,8 +381,9 @@ def test_sizing_survives_a_held_symbol_with_no_known_close_yet(monkeypatch):
 def test_buy_is_shrunk_to_fit_cash_after_costs_not_skipped():
     """One slot, 100000 capital, real transaction costs. The target is the
     whole 100000, but 1000 shares at 100 plus buy-side costs (~0.119%) would
-    need 100119 of cash. The buy must shrink to the largest quantity whose
-    value plus costs fits: floor(100000 / (100 * 1.00119171)) = 998 shares.
+    need ~100119 of cash. The buy must shrink to the largest quantity whose
+    value plus costs fits: 998 shares (998*100 + 118.50 = 99918.50; 999
+    shares would need 100018.62).
 
     Would catch: a BUY being skipped outright whenever the target allocation
     leaves no room for costs (with one slot, every single entry), or cash
@@ -461,6 +461,22 @@ def test_same_day_sell_frees_its_slot_before_buys_execute(monkeypatch):
     assert trades.iloc[1]["exit_reason"] == "SIGNAL"
 
     conn.close()
+
+
+def test_affordable_quantity_holds_under_a_flat_buy_fee(monkeypatch):
+    """With a flat Rs 50 fee per BUY, the proportional estimate at the
+    budget's size (rate = 50/1000 = 5%) gives floor(1000 / 1.05) = 952
+    shares at Rs 1, whose debit 952 + 50 = 1002 exceeds the 1000 budget.
+    The quantity must step down to 950 (950 + 50 = 1000).
+
+    Would catch: sizing that treats the cost function as a pure percentage,
+    which overspends the budget as soon as any fee is flat.
+    """
+    monkeypatch.setattr(
+        backtest, "calculate_transaction_cost", lambda trade_value, side: 50.0 if side == "BUY" else 0.0
+    )
+    assert backtest._affordable_quantity(1000.0, 1.0) == 950
+    assert backtest._affordable_quantity(40.0, 1.0) == 0
 
 
 def test_force_close_at_end_of_backtest(monkeypatch):
