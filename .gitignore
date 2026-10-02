@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data: large, binary, fully regenerable via the fetch pipeline (src/universe.py,
+# extend_history.py) -- never committed.
+data/*.duckdb
+
+# Generated run outputs (backtest_cli.py, research/screen.py) -- regenerable,
+# kept out of version control to avoid committing stale results.
+results/
+
+# OS
+.DS_Store

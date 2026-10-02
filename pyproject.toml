@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "network: hits a real external network/API (yfinance, NSE, Wikipedia) -- none should by default; mock instead",
+    "realdata: depends on data/trading_data.duckdb existing -- self-skips when that file is absent",
+]

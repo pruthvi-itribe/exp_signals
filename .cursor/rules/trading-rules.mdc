@@ -1,0 +1,12 @@
+---
+description: Rules for financial trading logic, data fetching, and storage.
+globs: **/*.py
+alwaysApply: true
+---
+
+# Trading Bot Coding Guidelines
+
+- **NSE Stock Symbol Handling:** Always format Indian stock tickers with `.NS` suffix (e.g., `RELIANCE.NS`, `TCS.NS`) when fetching from yfinance.
+- **No Lookahead Bias:** When processing historical bars, functions must never query timestamps higher than index `t`.
+- **Database Integrity:** Use primary key `(symbol, timestamp, timeframe)` in DuckDB to enforce timestamp uniqueness and avoid duplicate candle insertion.
+- **Type Hints:** Use explicit Python type hints on all function parameters and return types.
