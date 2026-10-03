@@ -479,6 +479,54 @@ def test_affordable_quantity_holds_under_a_flat_buy_fee(monkeypatch):
     assert backtest._affordable_quantity(40.0, 1.0) == 0
 
 
+def test_runs_record_the_engine_version(monkeypatch):
+    """Every stored run carries backtest.ENGINE_VERSION, so runs from before
+    and after an engine change (sizing, ordering, costs) can be told apart
+    in backtest_runs.
+
+    Would catch: the version not being written, or being written as a
+    constant other than ENGINE_VERSION.
+    """
+    _zero_cost(monkeypatch)
+    conn = _make_conn()
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100)])
+    _insert_signal(conn, "AAA", "2024-01-01", "test_strategy", "BUY")
+
+    run_id = run_backtest(
+        conn, strategy_name="test_strategy", start_date="2024-01-01", end_date="2024-01-02",
+        initial_capital=100_000, slippage_pct=0.0, symbols=["AAA"], max_concurrent_positions=1,
+    )
+
+    version = conn.execute("SELECT engine_version FROM backtest_runs WHERE run_id = ?", [run_id]).fetchone()[0]
+    assert version == backtest.ENGINE_VERSION
+    conn.close()
+
+
+def test_schema_upgrade_adds_engine_version_and_keeps_old_runs():
+    """A backtest_runs table created before engine_version existed gains the
+    column; its existing rows read NULL (= recorded by an older engine).
+
+    Would catch: the upgrade failing on an existing database, or old rows
+    being back-filled with the current version (mislabelling old results).
+    """
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        """
+        CREATE TABLE backtest_runs (
+            run_id VARCHAR NOT NULL PRIMARY KEY, strategy_name VARCHAR NOT NULL,
+            start_date DATE NOT NULL, end_date DATE NOT NULL, initial_capital DOUBLE NOT NULL,
+            position_sizing VARCHAR NOT NULL, created_at TIMESTAMP DEFAULT current_timestamp
+        )
+        """
+    )
+    conn.execute("INSERT INTO backtest_runs VALUES ('old', 's', '2024-01-01', '2024-01-02', 1, 'equal_weight', NULL)")
+
+    backtest.ensure_backtest_schema(conn)
+
+    assert conn.execute("SELECT engine_version FROM backtest_runs WHERE run_id = 'old'").fetchone()[0] is None
+    conn.close()
+
+
 def test_force_close_at_end_of_backtest(monkeypatch):
     """A BUY with no matching SELL before end_date is force-closed at end_date.
 

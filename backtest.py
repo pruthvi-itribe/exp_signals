@@ -12,6 +12,12 @@ from src.universe import get_active_universe
 
 DEFAULT_DB_PATH: Path = Path("data/trading_data.duckdb")
 
+# Stored on every backtest_runs row so results from different engine
+# semantics are never compared by accident. NULL = recorded before this
+# column existed (cash / N sizing, interleaved same-morning fills, older
+# cost model). 2 = equity-based sizing, sells before buys, broker-checked costs.
+ENGINE_VERSION: int = 2
+
 # Flat depository (DP) charge per delivery SELL, before GST. Broker-dependent:
 # Rs 20 is Upstox's (FY2026-27); other brokers charge roughly Rs 13-20. Being
 # flat, it weighs more on small positions.
@@ -137,6 +143,9 @@ def ensure_backtest_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    # Databases created before ENGINE_VERSION existed gain the column; their
+    # old rows keep NULL rather than being mislabelled with the current version.
+    conn.execute("ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS engine_version INTEGER")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS backtest_trades (
@@ -517,10 +526,10 @@ def store_backtest_results(
     conn.execute(
         """
         INSERT INTO backtest_runs (
-            run_id, strategy_name, start_date, end_date, initial_capital, position_sizing
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            run_id, strategy_name, start_date, end_date, initial_capital, position_sizing, engine_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        [run_id, strategy_name, start_date, end_date, initial_capital, position_sizing],
+        [run_id, strategy_name, start_date, end_date, initial_capital, position_sizing, ENGINE_VERSION],
     )
 
     conn.execute(
